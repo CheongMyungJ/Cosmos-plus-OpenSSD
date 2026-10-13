@@ -1,0 +1,339 @@
+diff --git a/firmware/address_translation.c b/firmware/address_translation.c
+index ee071f1..e3f547f 100644
+--- a/firmware/address_translation.c
++++ b/firmware/address_translation.c
+@@ -266,17 +266,7 @@ void ReadBadBlockTable(unsigned int tempBbtBufAddr[], unsigned int tempBbtBufEnt
+ 	{
+ 		for(dieNo = 0; dieNo < USER_DIES; dieNo++)
+ 		{
+-			reqSlotTag = GetFromFreeReqQ();
+-
+-			reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+-			reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_READ;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_ADDR;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_PHY_ORG;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEcc = REQ_OPT_NAND_ECC_ON;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEccWarning = REQ_OPT_NAND_ECC_WARNING_OFF;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_NONE;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_TOTAL;
+-
++			reqSlotTag = GetNandReq(REQ_CODE_READ, REQ_OPT_DATA_BUF_ADDR, REQ_OPT_NAND_ADDR_PHY_ORG, REQ_OPT_NAND_ECC_ON, REQ_OPT_NAND_ECC_WARNING_OFF, REQ_OPT_ROW_ADDR_DEPENDENCY_NONE, REQ_OPT_BLOCK_SPACE_TOTAL);
+ 			reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.addr = tempBbtBufAddr[dieNo] + loop * tempBbtBufEntrySize;
+ 
+ 			reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalCh = Vdie2PchTranslation(dieNo);
+@@ -311,17 +301,7 @@ void FindBadBlock(unsigned char dieState[], unsigned int tempBbtBufAddr[], unsig
+ 			{
+ 				blockChecker[dieNo] = BLOCK_STATE_NORMAL;
+ 
+-				reqSlotTag = GetFromFreeReqQ();
+-
+-				reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+-				reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_READ;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_ADDR;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_PHY_ORG;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEcc = REQ_OPT_NAND_ECC_OFF;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEccWarning = REQ_OPT_NAND_ECC_WARNING_OFF;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_NONE;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_TOTAL;
+-
++				reqSlotTag = GetNandReq(REQ_CODE_READ, REQ_OPT_DATA_BUF_ADDR, REQ_OPT_NAND_ADDR_PHY_ORG, REQ_OPT_NAND_ECC_OFF, REQ_OPT_NAND_ECC_WARNING_OFF, REQ_OPT_ROW_ADDR_DEPENDENCY_NONE, REQ_OPT_BLOCK_SPACE_TOTAL);
+ 				reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.addr = tempReadBufAddr[dieNo];
+ 
+ 				reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalCh = Vdie2PchTranslation(dieNo);
+@@ -342,17 +322,7 @@ void FindBadBlock(unsigned char dieState[], unsigned int tempBbtBufAddr[], unsig
+ 
+ 				if((*markPointer0 == CLEAN_DATA_IN_BYTE) && (*markPointer1 == CLEAN_DATA_IN_BYTE))
+ 				{
+-					reqSlotTag = GetFromFreeReqQ();
+-
+-					reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+-					reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_READ;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_ADDR;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_PHY_ORG;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEcc = REQ_OPT_NAND_ECC_OFF;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEccWarning = REQ_OPT_NAND_ECC_WARNING_OFF;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_NONE;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_TOTAL;
+-
++					reqSlotTag = GetNandReq(REQ_CODE_READ, REQ_OPT_DATA_BUF_ADDR, REQ_OPT_NAND_ADDR_PHY_ORG, REQ_OPT_NAND_ECC_OFF, REQ_OPT_NAND_ECC_WARNING_OFF, REQ_OPT_ROW_ADDR_DEPENDENCY_NONE, REQ_OPT_BLOCK_SPACE_TOTAL);
+ 					reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.addr = tempReadBufAddr[dieNo];
+ 
+ 					reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalCh = Vdie2PchTranslation(dieNo);
+@@ -411,15 +381,7 @@ void SaveBadBlockTable(unsigned char dieState[], unsigned int tempBbtBufAddr[],
+ 			{
+ 				if(loop == 0)
+ 				{
+-					reqSlotTag = GetFromFreeReqQ();
+-
+-					reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+-					reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_ERASE;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_PHY_ORG;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_NONE;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_NONE;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_TOTAL;
+-
++					reqSlotTag = GetNandReq(REQ_CODE_ERASE, REQ_OPT_DATA_BUF_NONE, REQ_OPT_NAND_ADDR_PHY_ORG, REQ_OPT_NAND_ECC_OFF, REQ_OPT_NAND_ECC_WARNING_OFF, REQ_OPT_ROW_ADDR_DEPENDENCY_NONE, REQ_OPT_BLOCK_SPACE_TOTAL);
+ 					reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalCh = Vdie2PchTranslation(dieNo);
+ 					reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalWay = Vdie2PwayTranslation(dieNo);
+ 					reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalBlock = bbtInfoMapPtr->bbtInfo[dieNo].phyBlock;
+@@ -428,17 +390,7 @@ void SaveBadBlockTable(unsigned char dieState[], unsigned int tempBbtBufAddr[],
+ 					SelectLowLevelReqQ(reqSlotTag);
+ 				}
+ 
+-				reqSlotTag = GetFromFreeReqQ();
+-
+-				reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+-				reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_WRITE;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_ADDR;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_PHY_ORG;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEcc = REQ_OPT_NAND_ECC_ON;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEccWarning = REQ_OPT_NAND_ECC_WARNING_OFF;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_NONE;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_TOTAL;
+-
++				reqSlotTag = GetNandReq(REQ_CODE_WRITE, REQ_OPT_DATA_BUF_ADDR, REQ_OPT_NAND_ADDR_PHY_ORG, REQ_OPT_NAND_ECC_ON, REQ_OPT_NAND_ECC_WARNING_OFF, REQ_OPT_ROW_ADDR_DEPENDENCY_NONE, REQ_OPT_BLOCK_SPACE_TOTAL);
+ 				reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.addr = tempBbtBufAddr[dieNo] + loop * tempBbtBufEntrySize;
+ 
+ 				reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalCh = Vdie2PchTranslation(dieNo);
+@@ -538,15 +490,7 @@ void EraseTotalBlockSpace()
+ 	for(blockNo=0 ; blockNo<TOTAL_BLOCKS_PER_DIE ; blockNo++)
+ 		for(dieNo=0 ; dieNo<USER_DIES ; dieNo++)
+ 		{
+-			reqSlotTag = GetFromFreeReqQ();
+-
+-			reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+-			reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_ERASE;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_PHY_ORG;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_NONE;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_NONE;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_TOTAL;
+-
++			reqSlotTag = GetNandReq(REQ_CODE_ERASE, REQ_OPT_DATA_BUF_NONE, REQ_OPT_NAND_ADDR_PHY_ORG, REQ_OPT_NAND_ECC_OFF, REQ_OPT_NAND_ECC_WARNING_OFF, REQ_OPT_ROW_ADDR_DEPENDENCY_NONE, REQ_OPT_BLOCK_SPACE_TOTAL);
+ 			reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalCh = Vdie2PchTranslation(dieNo);
+ 			reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalWay = Vdie2PwayTranslation(dieNo);
+ 			reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalBlock = blockNo;
+@@ -571,15 +515,7 @@ void EraseUserBlockSpace()
+ 		for(dieNo=0 ; dieNo<USER_DIES ; dieNo++)
+ 			if(!virtualBlockMapPtr->block[dieNo][blockNo].bad)
+ 			{
+-				reqSlotTag = GetFromFreeReqQ();
+-
+-				reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+-				reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_ERASE;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_VSA;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_NONE;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_NONE;
+-				reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_MAIN;
+-
++				reqSlotTag = GetNandReq(REQ_CODE_ERASE, REQ_OPT_DATA_BUF_NONE, REQ_OPT_NAND_ADDR_VSA, REQ_OPT_NAND_ECC_OFF, REQ_OPT_NAND_ECC_WARNING_OFF, REQ_OPT_ROW_ADDR_DEPENDENCY_NONE, REQ_OPT_BLOCK_SPACE_MAIN);
+ 				reqPoolPtr->reqPool[reqSlotTag].nandInfo.virtualSliceAddr = Vorg2VsaTranslation(dieNo, blockNo, 0);
+ 
+ 				SelectLowLevelReqQ(reqSlotTag);
+@@ -775,14 +711,7 @@ void EraseBlock(unsigned int dieNo, unsigned int blockNo)
+ {
+ 	unsigned int pageNo, virtualSliceAddr, reqSlotTag;
+ 
+-	reqSlotTag = GetFromFreeReqQ();
+-
+-	reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+-	reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_ERASE;
+-	reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_VSA;
+-	reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_NONE;
+-	reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_CHECK;
+-	reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_MAIN;
++	reqSlotTag = GetNandReq(REQ_CODE_ERASE, REQ_OPT_DATA_BUF_NONE, REQ_OPT_NAND_ADDR_VSA, REQ_OPT_NAND_ECC_OFF, REQ_OPT_NAND_ECC_WARNING_OFF, REQ_OPT_ROW_ADDR_DEPENDENCY_CHECK, REQ_OPT_BLOCK_SPACE_MAIN);
+ 	reqPoolPtr->reqPool[reqSlotTag].nandInfo.virtualSliceAddr = Vorg2VsaTranslation(dieNo, blockNo, 0);
+ 	reqPoolPtr->reqPool[reqSlotTag].nandInfo.programmedPageCnt = virtualBlockMapPtr->block[dieNo][blockNo].currentPage;
+ 
+diff --git a/firmware/checkpoint.c b/firmware/checkpoint.c
+index cfa2ca1..e2f0013 100644
+--- a/firmware/checkpoint.c
++++ b/firmware/checkpoint.c
+@@ -22,16 +22,8 @@ static unsigned int checkpointNextPage;		//next free page in it
+ 
+ static void IssueCheckpointNandReq(unsigned int reqCode, unsigned int dieNo, unsigned int blockNo, unsigned int pageNo, unsigned int bufAddr)
+ {
+-	unsigned int reqSlotTag = GetFromFreeReqQ();
+-
+-	reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+-	reqPoolPtr->reqPool[reqSlotTag].reqCode = reqCode;
++	unsigned int reqSlotTag = GetNandReq(reqCode, (reqCode == REQ_CODE_ERASE) ? REQ_OPT_DATA_BUF_NONE : REQ_OPT_DATA_BUF_ADDR, REQ_OPT_NAND_ADDR_VSA, REQ_OPT_NAND_ECC_ON, REQ_OPT_NAND_ECC_WARNING_OFF, REQ_OPT_ROW_ADDR_DEPENDENCY_NONE, REQ_OPT_BLOCK_SPACE_MAIN);
+ 	reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = (reqCode == REQ_CODE_ERASE) ? REQ_OPT_DATA_BUF_NONE : REQ_OPT_DATA_BUF_ADDR;
+-	reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_VSA;
+-	reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEcc = REQ_OPT_NAND_ECC_ON;
+-	reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEccWarning = REQ_OPT_NAND_ECC_WARNING_OFF;
+-	reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_NONE;
+-	reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_MAIN;
+ 	reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.addr = bufAddr;
+ 	reqPoolPtr->reqPool[reqSlotTag].nandInfo.virtualSliceAddr = Vorg2VsaTranslation(dieNo, blockNo, pageNo);
+ 	reqPoolPtr->reqPool[reqSlotTag].nandInfo.programmedPageCnt = USER_PAGES_PER_BLOCK;
+diff --git a/firmware/ftl_config.c b/firmware/ftl_config.c
+index b0d526f..54f313b 100644
+--- a/firmware/ftl_config.c
++++ b/firmware/ftl_config.c
+@@ -113,14 +113,7 @@ void InitNandArray()
+ 	for(chNo=0; chNo<USER_CHANNELS; ++chNo)
+ 		for(wayNo=0; wayNo<USER_WAYS; ++wayNo)
+ 		{
+-			reqSlotTag = GetFromFreeReqQ();
+-
+-			reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+-			reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_RESET;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_PHY_ORG;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_NONE;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_NONE;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_TOTAL;
++			reqSlotTag = GetNandReq(REQ_CODE_RESET, REQ_OPT_DATA_BUF_NONE, REQ_OPT_NAND_ADDR_PHY_ORG, REQ_OPT_NAND_ECC_OFF, REQ_OPT_NAND_ECC_WARNING_OFF, REQ_OPT_ROW_ADDR_DEPENDENCY_NONE, REQ_OPT_BLOCK_SPACE_TOTAL);
+ 			reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalCh = chNo;
+ 			reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalWay = wayNo;
+ 			reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalBlock = 0;	//dummy
+@@ -129,14 +122,7 @@ void InitNandArray()
+ 
+ 			SelectLowLevelReqQ(reqSlotTag);
+ 
+-			reqSlotTag = GetFromFreeReqQ();
+-
+-			reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+-			reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_SET_FEATURE;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr =  REQ_OPT_NAND_ADDR_PHY_ORG;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_NONE;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_NONE;
+-			reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_TOTAL;
++			reqSlotTag = GetNandReq(REQ_CODE_SET_FEATURE, REQ_OPT_DATA_BUF_NONE, REQ_OPT_NAND_ADDR_PHY_ORG, REQ_OPT_NAND_ECC_OFF, REQ_OPT_NAND_ECC_WARNING_OFF, REQ_OPT_ROW_ADDR_DEPENDENCY_NONE, REQ_OPT_BLOCK_SPACE_TOTAL);
+ 			reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalCh = chNo;
+ 			reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalWay = wayNo;
+ 			reqPoolPtr->reqPool[reqSlotTag].nandInfo.physicalBlock = 0;	//dummy
+diff --git a/firmware/garbage_collection.c b/firmware/garbage_collection.c
+index 98568a9..be1a5f7 100644
+--- a/firmware/garbage_collection.c
++++ b/firmware/garbage_collection.c
+@@ -86,17 +86,8 @@ void GarbageCollection(unsigned int dieNo)
+ 				if(logicalSliceMapPtr->logicalSlice[logicalSliceAddr].virtualSliceAddr ==  virtualSliceAddr) //valid data
+ 				{
+ 					//read
+-					reqSlotTag = GetFromFreeReqQ();
+-
+-					reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+-					reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_READ;
++					reqSlotTag = GetNandReq(REQ_CODE_READ, REQ_OPT_DATA_BUF_TEMP_ENTRY, REQ_OPT_NAND_ADDR_VSA, REQ_OPT_NAND_ECC_ON, REQ_OPT_NAND_ECC_WARNING_ON, REQ_OPT_ROW_ADDR_DEPENDENCY_CHECK, REQ_OPT_BLOCK_SPACE_MAIN);
+ 					reqPoolPtr->reqPool[reqSlotTag].logicalSliceAddr = logicalSliceAddr;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_TEMP_ENTRY;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_VSA;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEcc = REQ_OPT_NAND_ECC_ON;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEccWarning = REQ_OPT_NAND_ECC_WARNING_OFF;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_CHECK;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_MAIN;
+ 					reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.entry = AllocateTempDataBuf(dieNo);
+ 					UpdateTempDataBufEntryInfoBlockingReq(reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.entry, reqSlotTag);
+ 					reqPoolPtr->reqPool[reqSlotTag].nandInfo.virtualSliceAddr = virtualSliceAddr;
+@@ -104,17 +95,8 @@ void GarbageCollection(unsigned int dieNo)
+ 					SelectLowLevelReqQ(reqSlotTag);
+ 
+ 					//write
+-					reqSlotTag = GetFromFreeReqQ();
+-
+-					reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+-					reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_WRITE;
++					reqSlotTag = GetNandReq(REQ_CODE_WRITE, REQ_OPT_DATA_BUF_TEMP_ENTRY, REQ_OPT_NAND_ADDR_VSA, REQ_OPT_NAND_ECC_ON, REQ_OPT_NAND_ECC_WARNING_OFF, REQ_OPT_ROW_ADDR_DEPENDENCY_CHECK, REQ_OPT_BLOCK_SPACE_MAIN);
+ 					reqPoolPtr->reqPool[reqSlotTag].logicalSliceAddr = logicalSliceAddr;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_TEMP_ENTRY;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_VSA;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEcc = REQ_OPT_NAND_ECC_ON;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEccWarning = REQ_OPT_NAND_ECC_WARNING_OFF;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_CHECK;
+-					reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_MAIN;
+ 					reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.entry = AllocateTempDataBuf(dieNo);
+ 					UpdateTempDataBufEntryInfoBlockingReq(reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.entry, reqSlotTag);
+ 					reqPoolPtr->reqPool[reqSlotTag].nandInfo.virtualSliceAddr = FindFreeVirtualSliceForGc(dieNoForGcCopy, victimBlockNo);
+diff --git a/firmware/request_allocation.c b/firmware/request_allocation.c
+index 1328ce5..47b049b 100644
+--- a/firmware/request_allocation.c
++++ b/firmware/request_allocation.c
+@@ -424,3 +424,25 @@ void GetFromNandReqQ(unsigned int chNo, unsigned int wayNo, unsigned int reqStat
+ 	PutToFreeReqQ(reqSlotTag);
+ 	ReleaseBlockedByBufDepReq(reqSlotTag);
+ }
++
++
++/**
++ * take a free request slot for a NAND request and fill its type, code and options.
++ * the caller fills the address and the data buffer
++ */
++unsigned int GetNandReq(unsigned int reqCode, unsigned int dataBufFormat, unsigned int nandAddr, unsigned int nandEcc,
++		unsigned int nandEccWarning, unsigned int rowAddrDependencyCheck, unsigned int blockSpace)
++{
++	unsigned int reqSlotTag = GetFromFreeReqQ();
++
++	reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
++	reqPoolPtr->reqPool[reqSlotTag].reqCode = reqCode;
++	reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = dataBufFormat;
++	reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = nandAddr;
++	reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEcc = nandEcc;
++	reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEccWarning = nandEccWarning;
++	reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = rowAddrDependencyCheck;
++	reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = blockSpace;
++
++	return reqSlotTag;
++}
+diff --git a/firmware/request_allocation.h b/firmware/request_allocation.h
+index 366cc9b..9d1265b 100644
+--- a/firmware/request_allocation.h
++++ b/firmware/request_allocation.h
+@@ -64,6 +64,8 @@ void InitReqPool();
+ 
+ void PutToFreeReqQ(unsigned int reqSlotTag);
+ unsigned int GetFromFreeReqQ();
++unsigned int GetNandReq(unsigned int reqCode, unsigned int dataBufFormat, unsigned int nandAddr, unsigned int nandEcc,
++		unsigned int nandEccWarning, unsigned int rowAddrDependencyCheck, unsigned int blockSpace);
+ 
+ void PutToSliceReqQ(unsigned int reqSlotTag);
+ unsigned int GetFromSliceReqQ();
+diff --git a/firmware/request_transform.c b/firmware/request_transform.c
+index 946ad72..d8db29b 100644
+--- a/firmware/request_transform.c
++++ b/firmware/request_transform.c
+@@ -171,23 +171,15 @@ void WriteBackDataBufEntry(unsigned int dataBufEntry, unsigned int nvmeCmdSlotTa
+ 		if(dataBufMapPtr->dataBuf[dataBufEntry].blockingReqTail != REQ_SLOT_TAG_NONE)
+ 			SyncAllLowLevelReqDone();
+ 
+-		reqSlotTag = GetFromFreeReqQ();
++		reqSlotTag = GetNandReq(REQ_CODE_WRITE, REQ_OPT_DATA_BUF_ENTRY, REQ_OPT_NAND_ADDR_VSA, REQ_OPT_NAND_ECC_ON, REQ_OPT_NAND_ECC_WARNING_ON, REQ_OPT_ROW_ADDR_DEPENDENCY_CHECK, REQ_OPT_BLOCK_SPACE_MAIN);
+ 
+ 		virtualSliceAddr =  AddrTransWrite(dataBufMapPtr->dataBuf[dataBufEntry].logicalSliceAddr);
+ 
+ 		spareAddr = SPARE_DATA_BUFFER_BASE_ADDR + dataBufEntry * BYTES_PER_SPARE_REGION_OF_SLICE;
+ 		FillPageMeta(spareAddr, dataBufMapPtr->dataBuf[dataBufEntry].logicalSliceAddr);
+ 
+-		reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+-		reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_WRITE;
+ 		reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag = nvmeCmdSlotTag;
+ 		reqPoolPtr->reqPool[reqSlotTag].logicalSliceAddr = dataBufMapPtr->dataBuf[dataBufEntry].logicalSliceAddr;
+-		reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_ENTRY;
+-		reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_VSA;
+-		reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEcc = REQ_OPT_NAND_ECC_ON;
+-		reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEccWarning = REQ_OPT_NAND_ECC_WARNING_ON;
+-		reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_CHECK;
+-		reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_MAIN;
+ 		reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.entry = dataBufEntry;
+ 		UpdateDataBufEntryInfoBlockingReq(dataBufEntry, reqSlotTag);
+ 		reqPoolPtr->reqPool[reqSlotTag].nandInfo.virtualSliceAddr = virtualSliceAddr;
+@@ -222,18 +214,9 @@ void DataReadFromNand(unsigned int originReqSlotTag)
+ 
+ 	if(virtualSliceAddr != VSA_FAIL)
+ 	{
+-		reqSlotTag = GetFromFreeReqQ();
+-
+-		reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+-		reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_READ;
++		reqSlotTag = GetNandReq(REQ_CODE_READ, REQ_OPT_DATA_BUF_ENTRY, REQ_OPT_NAND_ADDR_VSA, REQ_OPT_NAND_ECC_ON, REQ_OPT_NAND_ECC_WARNING_ON, REQ_OPT_ROW_ADDR_DEPENDENCY_CHECK, REQ_OPT_BLOCK_SPACE_MAIN);
+ 		reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag = reqPoolPtr->reqPool[originReqSlotTag].nvmeCmdSlotTag;
+ 		reqPoolPtr->reqPool[reqSlotTag].logicalSliceAddr = reqPoolPtr->reqPool[originReqSlotTag].logicalSliceAddr;
+-		reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_ENTRY;
+-		reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_VSA;
+-		reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEcc = REQ_OPT_NAND_ECC_ON;
+-		reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEccWarning = REQ_OPT_NAND_ECC_WARNING_ON;
+-		reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_CHECK;
+-		reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_MAIN;
+ 
+ 		reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.entry = reqPoolPtr->reqPool[originReqSlotTag].dataBufInfo.entry;
+ 		UpdateDataBufEntryInfoBlockingReq(reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.entry, reqSlotTag);

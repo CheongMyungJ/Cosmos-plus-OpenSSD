@@ -1,0 +1,216 @@
+diff --git a/firmware/nvme/nvme_io_cmd.c b/firmware/nvme/nvme_io_cmd.c
+index d267585..d694c4f 100644
+--- a/firmware/nvme/nvme_io_cmd.c
++++ b/firmware/nvme/nvme_io_cmd.c
+@@ -127,7 +127,8 @@ void handle_nvme_io_cmd(NVME_COMMAND *nvmeCmd)
+ 	{
+ 		case IO_NVM_FLUSH:
+ 		{
+-			xil_printf("IO Flush Command\r\n");
++			//data written before the flush must be on NAND when it completes (docs/design/power-loss.md)
++			FlushDataBuf();
+ 			nvmeCPL.dword[0] = 0;
+ 			nvmeCPL.specific = 0x0;
+ 			set_auto_nvme_cpl(nvmeCmd->cmdSlotTag, nvmeCPL.specific, nvmeCPL.statusFieldWord);
+diff --git a/firmware/nvme/nvme_main.c b/firmware/nvme/nvme_main.c
+index cb651e5..06bb66d 100644
+--- a/firmware/nvme/nvme_main.c
++++ b/firmware/nvme/nvme_main.c
+@@ -127,6 +127,9 @@ void nvme_main()
+ 				unsigned int qID;
+ 				set_nvme_csts_shst(1);
+ 
++				//write the dirty data buffer entries before reporting shutdown complete (docs/design/power-loss.md)
++				FlushDataBuf();
++
+ 				for(qID = 0; qID < 8; qID++)
+ 				{
+ 					set_io_cq(qID, 0, 0, 0, 0, 0, 0);
+diff --git a/firmware/page_meta.c b/firmware/page_meta.c
+new file mode 100644
+index 0000000..7eaaa0e
+--- /dev/null
++++ b/firmware/page_meta.c
+@@ -0,0 +1,64 @@
++//////////////////////////////////////////////////////////////////////////////////
++// page_meta.c: metadata in the user spare of every user data page — docs/design/power-loss.md
++//////////////////////////////////////////////////////////////////////////////////
++
++#include <string.h>
++#include "page_meta.h"
++
++unsigned int g_writeSeq;
++
++unsigned int Crc32(const void* data, unsigned int length)
++{
++	const unsigned char* p = (const unsigned char*)data;
++	unsigned int crc = 0xFFFFFFFF;
++	unsigned int i, k;
++
++	for(i = 0; i < length; i++)
++	{
++		crc ^= p[i];
++		for(k = 0; k < 8; k++)
++			crc = (crc >> 1) ^ (0xEDB88320 & (0 - (crc & 1)));
++	}
++	return ~crc;
++}
++
++void FillPageMeta(unsigned int spareAddr, unsigned int logicalSliceAddr)
++{
++	P_PAGE_META meta = (P_PAGE_META)spareAddr;
++
++	memset(meta, 0xFF, sizeof(PAGE_META));
++	meta->badMark = PAGE_META_BAD_MARK;
++	meta->magic[0] = PAGE_META_MAGIC0;
++	meta->magic[1] = PAGE_META_MAGIC1;
++	meta->version = PAGE_META_VERSION;
++	meta->type = PAGE_META_TYPE_USER_DATA;
++	meta->logicalSliceAddr = logicalSliceAddr;
++	meta->writeSeq = g_writeSeq++;
++	meta->crc = Crc32(meta, 16);
++}
++
++int ParsePageMeta(unsigned int spareAddr, unsigned int* logicalSliceAddr, unsigned int* writeSeq)
++{
++	P_PAGE_META meta = (P_PAGE_META)spareAddr;
++
++	if(meta->magic[0] != PAGE_META_MAGIC0 || meta->magic[1] != PAGE_META_MAGIC1)
++		return 0;
++	if(meta->version != PAGE_META_VERSION || meta->type != PAGE_META_TYPE_USER_DATA)
++		return 0;
++	if(meta->crc != Crc32(meta, 16))
++		return 0;
++	*logicalSliceAddr = meta->logicalSliceAddr;
++	*writeSeq = meta->writeSeq;
++	return 1;
++}
++
++int IsErasedPageMeta(unsigned int spareAddr)
++{
++	const unsigned char* p = (const unsigned char*)spareAddr;
++	unsigned int i;
++
++	for(i = 0; i < sizeof(PAGE_META); i++)
++		if(p[i] != 0xFF)
++			return 0;
++	return 1;
++}
+diff --git a/firmware/page_meta.h b/firmware/page_meta.h
+new file mode 100644
+index 0000000..bd6c39f
+--- /dev/null
++++ b/firmware/page_meta.h
+@@ -0,0 +1,33 @@
++//////////////////////////////////////////////////////////////////////////////////
++// page_meta.h: metadata in the user spare of every user data page — docs/design/power-loss.md
++//////////////////////////////////////////////////////////////////////////////////
++
++#ifndef PAGE_META_H_
++#define PAGE_META_H_
++
++#define PAGE_META_BAD_MARK		0xFF	//byte 0 is the factory bad block mark position: keep it 0xFF
++#define PAGE_META_MAGIC0		'R'
++#define PAGE_META_MAGIC1		'M'
++#define PAGE_META_VERSION		1
++
++#define PAGE_META_TYPE_USER_DATA	1
++
++typedef struct _PAGE_META {
++	unsigned char badMark;
++	unsigned char magic[2];
++	unsigned char version;
++	unsigned char type;
++	unsigned char reserved0[3];
++	unsigned int logicalSliceAddr;
++	unsigned int writeSeq;
++	unsigned int crc;
++} PAGE_META, *P_PAGE_META;
++
++unsigned int Crc32(const void* data, unsigned int length);
++void FillPageMeta(unsigned int spareAddr, unsigned int logicalSliceAddr);
++int ParsePageMeta(unsigned int spareAddr, unsigned int* logicalSliceAddr, unsigned int* writeSeq);
++int IsErasedPageMeta(unsigned int spareAddr);
++
++extern unsigned int g_writeSeq;
++
++#endif /* PAGE_META_H_ */
+diff --git a/firmware/request_transform.c b/firmware/request_transform.c
+index 683fb08..946ad72 100644
+--- a/firmware/request_transform.c
++++ b/firmware/request_transform.c
+@@ -49,6 +49,7 @@
+ 
+ #include <string.h>
+ #include "xil_printf.h"
++#include "page_meta.h"
+ #include <assert.h>
+ #include "nvme/nvme.h"
+ #include "nvme/host_lld.h"
+@@ -160,19 +161,26 @@ void ReqTransNvmeToSlice(unsigned int cmdSlotTag, unsigned int startLba, unsigne
+ 
+ 
+ 
+-void EvictDataBufEntry(unsigned int originReqSlotTag)
++void WriteBackDataBufEntry(unsigned int dataBufEntry, unsigned int nvmeCmdSlotTag)
+ {
+-	unsigned int reqSlotTag, virtualSliceAddr, dataBufEntry;
++	unsigned int reqSlotTag, virtualSliceAddr, spareAddr;
+ 
+-	dataBufEntry = reqPoolPtr->reqPool[originReqSlotTag].dataBufInfo.entry;
+ 	if(dataBufMapPtr->dataBuf[dataBufEntry].dirty == DATA_BUF_DIRTY)
+ 	{
++		//a read into this entry may still be pending and would overwrite the spare: let it finish first
++		if(dataBufMapPtr->dataBuf[dataBufEntry].blockingReqTail != REQ_SLOT_TAG_NONE)
++			SyncAllLowLevelReqDone();
++
+ 		reqSlotTag = GetFromFreeReqQ();
++
+ 		virtualSliceAddr =  AddrTransWrite(dataBufMapPtr->dataBuf[dataBufEntry].logicalSliceAddr);
+ 
++		spareAddr = SPARE_DATA_BUFFER_BASE_ADDR + dataBufEntry * BYTES_PER_SPARE_REGION_OF_SLICE;
++		FillPageMeta(spareAddr, dataBufMapPtr->dataBuf[dataBufEntry].logicalSliceAddr);
++
+ 		reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+ 		reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_WRITE;
+-		reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag = reqPoolPtr->reqPool[originReqSlotTag].nvmeCmdSlotTag;
++		reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag = nvmeCmdSlotTag;
+ 		reqPoolPtr->reqPool[reqSlotTag].logicalSliceAddr = dataBufMapPtr->dataBuf[dataBufEntry].logicalSliceAddr;
+ 		reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_ENTRY;
+ 		reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_VSA;
+@@ -190,6 +198,22 @@ void EvictDataBufEntry(unsigned int originReqSlotTag)
+ 	}
+ }
+ 
++void EvictDataBufEntry(unsigned int originReqSlotTag)
++{
++	WriteBackDataBufEntry(reqPoolPtr->reqPool[originReqSlotTag].dataBufInfo.entry, reqPoolPtr->reqPool[originReqSlotTag].nvmeCmdSlotTag);
++}
++
++/** write every dirty data buffer entry to NAND and wait until they are programmed (Flush, shutdown) */
++void FlushDataBuf()
++{
++	unsigned int dataBufEntry;
++
++	for(dataBufEntry = 0; dataBufEntry < AVAILABLE_DATA_BUFFER_ENTRY_COUNT; dataBufEntry++)
++		WriteBackDataBufEntry(dataBufEntry, 0);
++
++	SyncAllLowLevelReqDone();
++}
++
+ void DataReadFromNand(unsigned int originReqSlotTag)
+ {
+ 	unsigned int reqSlotTag, virtualSliceAddr;
+diff --git a/firmware/request_transform.h b/firmware/request_transform.h
+index 9849d33..52ba6e2 100644
+--- a/firmware/request_transform.h
++++ b/firmware/request_transform.h
+@@ -80,6 +80,8 @@ void InitDependencyTable();
+ void ReqTransNvmeToSlice(unsigned int cmdSlotTag, unsigned int startLba, unsigned int nlb, unsigned int cmdCode);
+ void ReqTransSliceToLowLevel();
+ void EvictDataBufEntry(unsigned int originReqSlotTag);
++void WriteBackDataBufEntry(unsigned int dataBufEntry, unsigned int nvmeCmdSlotTag);
++void FlushDataBuf();
+ void DataReadFromNand(unsigned int originReqSlotTag);
+ void IssueNvmeDmaReq(unsigned int reqSlotTag);
+ void CheckDoneNvmeDmaReq();

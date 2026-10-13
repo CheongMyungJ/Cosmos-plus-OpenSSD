@@ -1,0 +1,460 @@
+diff --git a/firmware/address_translation.c b/firmware/address_translation.c
+index 6e90af0..ee071f1 100644
+--- a/firmware/address_translation.c
++++ b/firmware/address_translation.c
+@@ -593,14 +593,10 @@ void EraseUserBlockSpace()
+ void InitBlockDieMap()
+ {
+ 	unsigned int dieNo;
+-	unsigned char eraseFlag = 1;
+ 
+ 	xil_printf("Press 'X' to re-make the bad block table.\r\n");
+ 	if (inbyte() == 'X')
+-	{
+ 		EraseTotalBlockSpace();
+-		eraseFlag = 0;
+-	}
+ 
+ 	InitDieMap();
+ 
+@@ -613,14 +609,12 @@ void InitBlockDieMap()
+ 
+ 	RemapBadBlock();
+ 
++	//user blocks are not erased: their pages are read back by RecoverFtl (docs/design/power-loss.md),
++	//which also builds the free block lists and picks the current blocks
+ 	InitBlockMap();
+-
+-	if(eraseFlag)
+-		EraseUserBlockSpace();
+-
+-	InitCurrentBlockOfDieMap();
+ }
+ 
++
+ unsigned int AddrTransRead(unsigned int logicalSliceAddr)
+ {
+ 	unsigned int virtualSliceAddr;
+diff --git a/firmware/checkpoint.c b/firmware/checkpoint.c
+new file mode 100644
+index 0000000..86342b6
+--- /dev/null
++++ b/firmware/checkpoint.c
+@@ -0,0 +1,301 @@
++//////////////////////////////////////////////////////////////////////////////////
++// checkpoint.c: checkpoint and boot recovery — docs/design/power-loss.md
++//
++// Every user data page carries its logical slice and a write sequence in the spare (page_meta.c).
++// At boot every user page is read: for each logical slice the page with the largest sequence wins.
++// A checkpoint records which logical slices are unmapped (deallocated) at a sequence, so data older
++// than the checkpoint does not come back for them.
++//////////////////////////////////////////////////////////////////////////////////
++
++#include <assert.h>
++#include <string.h>
++#include "xil_printf.h"
++#include "memory_map.h"
++#include "page_meta.h"
++
++#define PAGE_BUF_BYTES (BYTES_PER_DATA_REGION_OF_PAGE + BYTES_PER_SPARE_REGION_OF_PAGE)
++
++P_RECOVERY_SEQ_TABLE recoverySeqTablePtr;
++
++static unsigned int checkpointBlock;		//block being appended
++static unsigned int checkpointNextPage;		//next free page in it
++
++static void IssueCheckpointNandReq(unsigned int reqCode, unsigned int dieNo, unsigned int blockNo, unsigned int pageNo, unsigned int bufAddr)
++{
++	unsigned int reqSlotTag = GetFromFreeReqQ();
++
++	reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
++	reqPoolPtr->reqPool[reqSlotTag].reqCode = reqCode;
++	reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = (reqCode == REQ_CODE_ERASE) ? REQ_OPT_DATA_BUF_NONE : REQ_OPT_DATA_BUF_ADDR;
++	reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_VSA;
++	reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEcc = REQ_OPT_NAND_ECC_ON;
++	reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEccWarning = REQ_OPT_NAND_ECC_WARNING_OFF;
++	reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_NONE;
++	reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_MAIN;
++	reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.addr = bufAddr;
++	reqPoolPtr->reqPool[reqSlotTag].nandInfo.virtualSliceAddr = Vorg2VsaTranslation(dieNo, blockNo, pageNo);
++	reqPoolPtr->reqPool[reqSlotTag].nandInfo.programmedPageCnt = USER_PAGES_PER_BLOCK;
++
++	SelectLowLevelReqQ(reqSlotTag);
++}
++
++/** write the unmapped state of every logical slice (the whole logical-to-virtual map) with the current write sequence */
++void WriteCheckpoint()
++{
++	unsigned int page, bytes;
++	P_CHECKPOINT_HEADER header;
++
++	//the map must only point at pages that are already programmed
++	SyncAllLowLevelReqDone();
++
++	if(checkpointNextPage + CHECKPOINT_PAGES > USER_PAGES_PER_BLOCK)
++	{
++		checkpointBlock = (checkpointBlock == CHECKPOINT_BLOCK0) ? CHECKPOINT_BLOCK1 : CHECKPOINT_BLOCK0;
++		IssueCheckpointNandReq(REQ_CODE_ERASE, CHECKPOINT_DIE, checkpointBlock, 0, 0);
++		SyncAllLowLevelReqDone();
++		checkpointNextPage = 0;
++	}
++
++	memset((void*)CHECKPOINT_BUFFER_ADDR, 0xFF, CHECKPOINT_PAGES * PAGE_BUF_BYTES);
++	for(page = 0; page < CHECKPOINT_MAP_PAGES; page++)
++	{
++		bytes = CHECKPOINT_MAP_BYTES - page * BYTES_PER_DATA_REGION_OF_PAGE;
++		if(bytes > BYTES_PER_DATA_REGION_OF_PAGE)
++			bytes = BYTES_PER_DATA_REGION_OF_PAGE;
++		memcpy((void*)(CHECKPOINT_BUFFER_ADDR + page * PAGE_BUF_BYTES), (unsigned char*)logicalSliceMapPtr + page * BYTES_PER_DATA_REGION_OF_PAGE, bytes);
++	}
++
++	header = (P_CHECKPOINT_HEADER)(CHECKPOINT_BUFFER_ADDR + CHECKPOINT_MAP_PAGES * PAGE_BUF_BYTES);
++	header->magic = CHECKPOINT_MAGIC;
++	header->version = CHECKPOINT_VERSION;
++	header->checkpointSeq = g_writeSeq;
++	header->mapPages = CHECKPOINT_MAP_PAGES;
++	header->mapCrc = Crc32(logicalSliceMapPtr, CHECKPOINT_MAP_BYTES);
++	header->headerCrc = Crc32(header, 20);
++
++	//map pages first, the header last: a checkpoint without its header does not count
++	for(page = 0; page < CHECKPOINT_PAGES; page++)
++		IssueCheckpointNandReq(REQ_CODE_WRITE, CHECKPOINT_DIE, checkpointBlock, checkpointNextPage + page, CHECKPOINT_BUFFER_ADDR + page * PAGE_BUF_BYTES);
++	SyncAllLowLevelReqDone();
++
++	checkpointNextPage += CHECKPOINT_PAGES;
++}
++
++static unsigned int ReadPageOfDie(unsigned int dieNo, unsigned int blockNo, unsigned int pageNo)
++{
++	unsigned int addr = RECOVERY_READ_BUFFER_ADDR + dieNo * PAGE_BUF_BYTES;
++	IssueCheckpointNandReq(REQ_CODE_READ, dieNo, blockNo, pageNo, addr);
++	SyncAllLowLevelReqDone();
++	return addr;
++}
++
++/**
++ * find the newest checkpoint whose header and map CRC are right and load its map into logicalSliceMap.
++ * @return 1 if found (*checkpointSeq set)
++ */
++static int LoadCheckpoint(unsigned int* checkpointSeq)
++{
++	unsigned int b, block, page, addr, found, bestBlock, bestPage, bestSeq, usedPages[2];
++	P_CHECKPOINT_HEADER header;
++
++	found = 0;
++	bestBlock = CHECKPOINT_BLOCK0;
++	bestPage = 0;
++	bestSeq = 0;
++	for(b = 0; b < 2; b++)
++	{
++		block = b ? CHECKPOINT_BLOCK1 : CHECKPOINT_BLOCK0;
++		usedPages[b] = 0;
++		for(page = 0; page < USER_PAGES_PER_BLOCK; page++)
++		{
++			addr = ReadPageOfDie(CHECKPOINT_DIE, block, page);
++			if(!IsErasedPageMeta(addr + BYTES_PER_DATA_REGION_OF_PAGE) || *(unsigned int*)addr != 0xFFFFFFFF)
++				usedPages[b] = page + 1;
++			header = (P_CHECKPOINT_HEADER)addr;
++			if(header->magic != CHECKPOINT_MAGIC || header->version != CHECKPOINT_VERSION || header->mapPages != CHECKPOINT_MAP_PAGES)
++				continue;
++			if(header->headerCrc != Crc32(header, 20) || page < CHECKPOINT_MAP_PAGES)
++				continue;
++			if(!found || header->checkpointSeq > bestSeq)
++			{
++				found = 1;
++				bestBlock = block;
++				bestPage = page;
++				bestSeq = header->checkpointSeq;
++			}
++		}
++	}
++
++	if(found)
++	{
++		unsigned int mapCrc;
++		addr = ReadPageOfDie(CHECKPOINT_DIE, bestBlock, bestPage);
++		mapCrc = ((P_CHECKPOINT_HEADER)addr)->mapCrc;
++		for(page = 0; page < CHECKPOINT_MAP_PAGES; page++)
++		{
++			unsigned int bytes = CHECKPOINT_MAP_BYTES - page * BYTES_PER_DATA_REGION_OF_PAGE;
++			if(bytes > BYTES_PER_DATA_REGION_OF_PAGE)
++				bytes = BYTES_PER_DATA_REGION_OF_PAGE;
++			addr = ReadPageOfDie(CHECKPOINT_DIE, bestBlock, bestPage - CHECKPOINT_MAP_PAGES + page);
++			memcpy((unsigned char*)logicalSliceMapPtr + page * BYTES_PER_DATA_REGION_OF_PAGE, (void*)addr, bytes);
++		}
++		if(mapCrc != Crc32(logicalSliceMapPtr, CHECKPOINT_MAP_BYTES))
++		{
++			xil_printf("[ checkpoint map CRC mismatch: ignored ]\r\n");
++			found = 0;
++		}
++	}
++
++	//append to the block holding the newest checkpoint. Without one, start over in block 0 (erased on first write)
++	if(found)
++	{
++		checkpointBlock = bestBlock;
++		checkpointNextPage = usedPages[bestBlock == CHECKPOINT_BLOCK1];
++		*checkpointSeq = bestSeq;
++	}
++	else
++	{
++		checkpointBlock = CHECKPOINT_BLOCK1;
++		checkpointNextPage = USER_PAGES_PER_BLOCK;
++	}
++	return found;
++}
++
++void RecoverFtl()
++{
++	unsigned int dieNo, blockNo, pageNo, addr, lsa, seq, vsa, hasCheckpoint, checkpointSeq, maxSeq, programmed, valid;
++	static unsigned char unmappedAtCheckpoint[SLICES_PER_SSD / 8 + 1];
++	static unsigned int blockMaxSeqPlusOne[USER_DIES][USER_BLOCKS_PER_DIE];
++	unsigned int resumeBlock, resumeSeq;
++
++	recoverySeqTablePtr = (P_RECOVERY_SEQ_TABLE) RECOVERY_SEQ_TABLE_ADDR;
++	memset(recoverySeqTablePtr, 0, sizeof(RECOVERY_SEQ_TABLE));
++	memset(blockMaxSeqPlusOne, 0, sizeof(blockMaxSeqPlusOne));
++
++	checkpointSeq = 0;
++	hasCheckpoint = LoadCheckpoint(&checkpointSeq);
++	memset(unmappedAtCheckpoint, 0, sizeof(unmappedAtCheckpoint));
++	for(lsa = 0; lsa < SLICES_PER_SSD; lsa++)
++	{
++		if(hasCheckpoint && logicalSliceMapPtr->logicalSlice[lsa].virtualSliceAddr == VSA_NONE)
++			unmappedAtCheckpoint[lsa / 8] |= (1 << (lsa % 8));
++		logicalSliceMapPtr->logicalSlice[lsa].virtualSliceAddr = VSA_NONE;
++		virtualSliceMapPtr->virtualSlice[lsa].logicalSliceAddr = LSA_NONE;
++	}
++
++	//read the meta of every user page: the page with the largest sequence of a logical slice wins
++	maxSeq = hasCheckpoint ? checkpointSeq : 0;
++	for(blockNo = 0; blockNo < USER_BLOCKS_PER_DIE; blockNo++)
++		for(pageNo = 0; pageNo < USER_PAGES_PER_BLOCK; pageNo++)
++		{
++			for(dieNo = 0; dieNo < USER_DIES; dieNo++)
++				if(!virtualBlockMapPtr->block[dieNo][blockNo].bad && !IsCheckpointBlock(dieNo, blockNo))
++					IssueCheckpointNandReq(REQ_CODE_READ, dieNo, blockNo, pageNo, RECOVERY_READ_BUFFER_ADDR + dieNo * PAGE_BUF_BYTES);
++			SyncAllLowLevelReqDone();
++
++			for(dieNo = 0; dieNo < USER_DIES; dieNo++)
++			{
++				if(virtualBlockMapPtr->block[dieNo][blockNo].bad || IsCheckpointBlock(dieNo, blockNo))
++					continue;
++				addr = RECOVERY_READ_BUFFER_ADDR + dieNo * PAGE_BUF_BYTES;
++				vsa = Vorg2VsaTranslation(dieNo, blockNo, pageNo);
++				if(!IsErasedPageMeta(addr + BYTES_PER_DATA_REGION_OF_PAGE))
++					virtualBlockMapPtr->block[dieNo][blockNo].currentPage = pageNo + 1;	//programmed up to here
++				if(!ParsePageMeta(addr + BYTES_PER_DATA_REGION_OF_PAGE, &lsa, &seq) || lsa >= SLICES_PER_SSD)
++					continue;
++				virtualSliceMapPtr->virtualSlice[vsa].logicalSliceAddr = lsa;
++				if(seq + 1 > blockMaxSeqPlusOne[dieNo][blockNo])
++					blockMaxSeqPlusOne[dieNo][blockNo] = seq + 1;
++				if(seq + 1 > maxSeq)
++					maxSeq = seq + 1;
++				if(recoverySeqTablePtr->seqPlusOne[lsa] <= seq)
++				{
++					recoverySeqTablePtr->seqPlusOne[lsa] = seq + 1;
++					logicalSliceMapPtr->logicalSlice[lsa].virtualSliceAddr = vsa;
++				}
++			}
++		}
++
++	//deallocated at the checkpoint and not written since: stays unmapped
++	for(lsa = 0; lsa < SLICES_PER_SSD; lsa++)
++		if((unmappedAtCheckpoint[lsa / 8] & (1 << (lsa % 8))) && recoverySeqTablePtr->seqPlusOne[lsa] <= checkpointSeq)
++			logicalSliceMapPtr->logicalSlice[lsa].virtualSliceAddr = VSA_NONE;
++
++	//rebuild the block states: unwritten blocks are free. Of the partly written blocks of a die, the one written last
++	//is the current block again (writing continues after its last page); other written blocks are closed and their
++	//stale pages count as invalid
++	for(dieNo = 0; dieNo < USER_DIES; dieNo++)
++	{
++		virtualDieMapPtr->die[dieNo].headFreeBlock = BLOCK_NONE;
++		virtualDieMapPtr->die[dieNo].tailFreeBlock = BLOCK_NONE;
++		virtualDieMapPtr->die[dieNo].freeBlockCnt = 0;
++	}
++	for(dieNo = 0; dieNo < USER_DIES; dieNo++)
++	{
++		resumeBlock = BLOCK_NONE;
++		resumeSeq = 0;
++		for(blockNo = 0; blockNo < USER_BLOCKS_PER_DIE; blockNo++)
++		{
++			programmed = virtualBlockMapPtr->block[dieNo][blockNo].currentPage;
++			if(virtualBlockMapPtr->block[dieNo][blockNo].bad || IsCheckpointBlock(dieNo, blockNo))
++				continue;
++			if(programmed > 0 && programmed < USER_PAGES_PER_BLOCK && blockMaxSeqPlusOne[dieNo][blockNo] >= resumeSeq)
++			{
++				resumeBlock = blockNo;
++				resumeSeq = blockMaxSeqPlusOne[dieNo][blockNo];
++			}
++		}
++
++		for(blockNo = 0; blockNo < USER_BLOCKS_PER_DIE; blockNo++)
++		{
++			P_VIRTUAL_BLOCK_ENTRY block = &virtualBlockMapPtr->block[dieNo][blockNo];
++			block->prevBlock = BLOCK_NONE;
++			block->nextBlock = BLOCK_NONE;
++			if(block->bad || IsCheckpointBlock(dieNo, blockNo))
++			{
++				block->free = 0;
++				continue;
++			}
++			programmed = block->currentPage;
++			valid = 0;
++			for(pageNo = 0; pageNo < USER_PAGES_PER_BLOCK; pageNo++)
++			{
++				vsa = Vorg2VsaTranslation(dieNo, blockNo, pageNo);
++				lsa = virtualSliceMapPtr->virtualSlice[vsa].logicalSliceAddr;
++				if(lsa != LSA_NONE && logicalSliceMapPtr->logicalSlice[lsa].virtualSliceAddr == vsa)
++					valid++;
++				else
++					virtualSliceMapPtr->virtualSlice[vsa].logicalSliceAddr = LSA_NONE;
++			}
++			if(programmed == 0)
++			{
++				block->invalidSliceCnt = 0;
++				block->free = 1;
++				PutToFbList(dieNo, blockNo);
++			}
++			else
++			{
++				block->free = 0;
++				if(blockNo != resumeBlock)
++					block->currentPage = USER_PAGES_PER_BLOCK;
++				block->invalidSliceCnt = block->currentPage - valid;
++				if(block->invalidSliceCnt)
++					PutToGcVictimList(dieNo, blockNo, block->invalidSliceCnt);
++			}
++		}
++
++		if(resumeBlock != BLOCK_NONE)
++			virtualDieMapPtr->die[dieNo].currentBlock = resumeBlock;
++		else
++		{
++			virtualDieMapPtr->die[dieNo].currentBlock = GetFromFbList(dieNo, GET_FREE_BLOCK_NORMAL);
++			if(virtualDieMapPtr->die[dieNo].currentBlock == BLOCK_FAIL)
++				virtualDieMapPtr->die[dieNo].currentBlock = GetFromFbList(dieNo, GET_FREE_BLOCK_GC);
++			if(virtualDieMapPtr->die[dieNo].currentBlock == BLOCK_FAIL)
++				assert(!"[WARNING] There is no free block after recovery [WARNING]");
++		}
++	}
++
++	g_writeSeq = maxSeq;
++	xil_printf("[ recovery done: checkpoint %d, next write sequence %d ]\r\n", hasCheckpoint, g_writeSeq);
++}
+diff --git a/firmware/checkpoint.h b/firmware/checkpoint.h
+new file mode 100644
+index 0000000..428cca0
+--- /dev/null
++++ b/firmware/checkpoint.h
+@@ -0,0 +1,39 @@
++//////////////////////////////////////////////////////////////////////////////////
++// checkpoint.h: checkpoint and boot recovery — docs/design/power-loss.md
++//////////////////////////////////////////////////////////////////////////////////
++
++#ifndef CHECKPOINT_H_
++#define CHECKPOINT_H_
++
++#include "ftl_config.h"
++
++//two virtual blocks of die 0 hold checkpoints and are kept out of the user block space
++#define CHECKPOINT_DIE				0
++#define CHECKPOINT_BLOCK0			(USER_BLOCKS_PER_DIE - 2)
++#define CHECKPOINT_BLOCK1			(USER_BLOCKS_PER_DIE - 1)
++#define IsCheckpointBlock(dieNo, blockNo) (((dieNo) == CHECKPOINT_DIE) && (((blockNo) == CHECKPOINT_BLOCK0) || ((blockNo) == CHECKPOINT_BLOCK1)))
++
++#define CHECKPOINT_MAP_BYTES		(SLICES_PER_SSD * 4)
++#define CHECKPOINT_MAP_PAGES		((CHECKPOINT_MAP_BYTES + BYTES_PER_DATA_REGION_OF_PAGE - 1) / BYTES_PER_DATA_REGION_OF_PAGE)
++#define CHECKPOINT_PAGES			(CHECKPOINT_MAP_PAGES + 1)	//map pages, then the header page
++
++#define CHECKPOINT_MAGIC			0x54504B43	//"CKPT"
++#define CHECKPOINT_VERSION			1
++
++typedef struct _CHECKPOINT_HEADER {
++	unsigned int magic;
++	unsigned int version;
++	unsigned int checkpointSeq;		//write sequence when the checkpoint was taken: pages before it are reflected
++	unsigned int mapPages;
++	unsigned int mapCrc;
++	unsigned int headerCrc;			//CRC32 of the fields above
++} CHECKPOINT_HEADER, *P_CHECKPOINT_HEADER;
++
++typedef struct _RECOVERY_SEQ_TABLE {
++	unsigned int seqPlusOne[SLICES_PER_SSD];	//0: no page seen
++} RECOVERY_SEQ_TABLE, *P_RECOVERY_SEQ_TABLE;
++
++void WriteCheckpoint();
++void RecoverFtl();
++
++#endif /* CHECKPOINT_H_ */
+diff --git a/firmware/ftl_config.c b/firmware/ftl_config.c
+index 0805ec3..b0d526f 100644
+--- a/firmware/ftl_config.c
++++ b/firmware/ftl_config.c
+@@ -66,6 +66,7 @@ void InitFTL()
+ 	InitAddressMap();
+ 	InitDataBuf();
+ 	InitGcVictimMap();
++	RecoverFtl();
+ 
+ 	storageCapacity_L = (MB_PER_SSD - (MB_PER_MIN_FREE_BLOCK_SPACE + mbPerbadBlockSpace + MB_PER_OVER_PROVISION_BLOCK_SPACE)) * ((1024*1024) / BYTES_PER_NVME_BLOCK);
+ 
+@@ -166,6 +167,10 @@ void CheckConfigRestriction()
+ 		assert(!"[WARNING] Configuration Error: Data buffer size is too large to be allocated to predefined range [WARNING]");
+ 	if(TEMPORARY_PAY_LOAD_ADDR + 0x00001000 > DATA_BUFFER_MAP_ADDR)
+ 		assert(!"[WARNING] Configuration Error: Metadata for NAND request completion process is too large to be allocated to predefined range [WARNING]");
++	if(CHECKPOINT_BUFFER_ADDR + CHECKPOINT_PAGES * (BYTES_PER_DATA_REGION_OF_PAGE + BYTES_PER_SPARE_REGION_OF_PAGE) > RECOVERY_READ_BUFFER_ADDR)
++		assert(!"[WARNING] Configuration Error: Checkpoint buffer is too large [WARNING]");
++	if(RECOVERY_READ_BUFFER_ADDR + USER_DIES * (BYTES_PER_DATA_REGION_OF_PAGE + BYTES_PER_SPARE_REGION_OF_PAGE) > RESERVED_DATA_BUFFER_BASE_ADDR + 0x00200000)
++		assert(!"[WARNING] Configuration Error: Recovery read buffer is too large [WARNING]");
+ 	if(FTL_MANAGEMENT_END_ADDR > DRAM_END_ADDR)
+ 		assert(!"[WARNING] Configuration Error: Metadata of FTL is too large to be allocated to DRAM [WARNING]");
+ }
+diff --git a/firmware/memory_map.h b/firmware/memory_map.h
+index 92fe866..424dbba 100644
+--- a/firmware/memory_map.h
++++ b/firmware/memory_map.h
+@@ -53,6 +53,7 @@
+ #include "request_schedule.h"
+ #include "request_transform.h"
+ #include "garbage_collection.h"
++#include "checkpoint.h"
+ 
+ #define DRAM_START_ADDR					0x00100000
+ 
+@@ -76,6 +77,9 @@
+ #define SPARE_DATA_BUFFER_BASE_ADDR				(TEMPORARY_DATA_BUFFER_BASE_ADDR + AVAILABLE_TEMPORARY_DATA_BUFFER_ENTRY_COUNT * BYTES_PER_DATA_REGION_OF_SLICE)
+ #define TEMPORARY_SPARE_DATA_BUFFER_BASE_ADDR	(SPARE_DATA_BUFFER_BASE_ADDR + AVAILABLE_DATA_BUFFER_ENTRY_COUNT * BYTES_PER_SPARE_REGION_OF_SLICE)
+ #define RESERVED_DATA_BUFFER_BASE_ADDR 			(TEMPORARY_SPARE_DATA_BUFFER_BASE_ADDR + AVAILABLE_TEMPORARY_DATA_BUFFER_ENTRY_COUNT * BYTES_PER_SPARE_REGION_OF_SLICE)
++//for checkpoint pages and recovery reads, inside the reserved data buffer area (docs/design/power-loss.md)
++#define CHECKPOINT_BUFFER_ADDR					(RESERVED_DATA_BUFFER_BASE_ADDR + 0x00100000)
++#define RECOVERY_READ_BUFFER_ADDR				(RESERVED_DATA_BUFFER_BASE_ADDR + 0x00180000)
+ //for nand request completion
+ #define COMPLETE_FLAG_TABLE_ADDR			0x17000000
+ #define STATUS_REPORT_TABLE_ADDR			(COMPLETE_FLAG_TABLE_ADDR + sizeof(COMPLETE_FLAG_TABLE))
+@@ -104,7 +108,10 @@
+ #define RETRY_LIMIT_TABLE_ADDR				(DIE_STATE_TABLE_ADDR + sizeof(DIE_STATE_TABLE))
+ #define WAY_PRIORITY_TABLE_ADDR 			(RETRY_LIMIT_TABLE_ADDR + sizeof(RETRY_LIMIT_TABLE))
+ 
+-#define FTL_MANAGEMENT_END_ADDR				((WAY_PRIORITY_TABLE_ADDR + sizeof(WAY_PRIORITY_TABLE))- 1)
++// for power loss recovery: write sequence of the newest page seen for each logical slice (docs/design/power-loss.md)
++#define RECOVERY_SEQ_TABLE_ADDR				(WAY_PRIORITY_TABLE_ADDR + sizeof(WAY_PRIORITY_TABLE))
++
++#define FTL_MANAGEMENT_END_ADDR				((RECOVERY_SEQ_TABLE_ADDR + sizeof(RECOVERY_SEQ_TABLE))- 1)
+ 
+ #define RESERVED1_START_ADDR				(FTL_MANAGEMENT_END_ADDR + 1)
+ #define RESERVED1_END_ADDR					0x3FFFFFFF
+diff --git a/firmware/trim.c b/firmware/trim.c
+index 4988e1c..8ed63e0 100644
+--- a/firmware/trim.c
++++ b/firmware/trim.c
+@@ -132,6 +132,9 @@ void handle_nvme_io_dataset_management(unsigned int cmdSlotTag, NVME_IO_COMMAND
+ 		for(i = 0; i < numOfRanges; i++)
+ 			if(range[i].length)
+ 				DeallocateRange(range[i].startingLba[0], range[i].length);
++
++		//the deallocation must survive a power loss (docs/design/power-loss.md)
++		WriteCheckpoint();
+ 	}
+ 
+ 	set_auto_nvme_cpl(cmdSlotTag, nvmeCPL.specific, nvmeCPL.statusFieldWord);

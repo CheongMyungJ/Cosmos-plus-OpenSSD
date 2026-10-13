@@ -1,0 +1,83 @@
+diff --git a/firmware/garbage_collection.c b/firmware/garbage_collection.c
+index 4f57bf4..5e3c74e 100644
+--- a/firmware/garbage_collection.c
++++ b/firmware/garbage_collection.c
+@@ -68,11 +68,11 @@ void InitGcVictimMap()
+ }
+ 
+ 
+-void GarbageCollection(unsigned int dieNo)
++/** move the valid slices of a block to the current block of its die and erase it (GC, static wear leveling) */
++void RelocateBlock(unsigned int dieNo, unsigned int victimBlockNo)
+ {
+-	unsigned int victimBlockNo, pageNo, virtualSliceAddr, logicalSliceAddr, dieNoForGcCopy, reqSlotTag;
++	unsigned int pageNo, virtualSliceAddr, logicalSliceAddr, dieNoForGcCopy, reqSlotTag;
+ 
+-	victimBlockNo = GetFromGcVictimList(dieNo);
+ 	dieNoForGcCopy = dieNo;
+ 
+ 	if(virtualBlockMapPtr->block[dieNo][victimBlockNo].invalidSliceCnt != SLICES_PER_BLOCK)
+@@ -122,6 +122,47 @@ void GarbageCollection(unsigned int dieNo)
+ }
+ 
+ 
++
++void GarbageCollection(unsigned int dieNo)
++{
++	RelocateBlock(dieNo, GetFromGcVictimList(dieNo));
++	StaticWearLeveling(dieNo);
++}
++
++/**
++ * static wear leveling (docs/design/wear-leveling.md): when the most erased block of the die is erased more than
++ * WEAR_LEVELING_THRESHOLD times as often as the least erased block holding data, move the data of the latter
++ * (the lowest number on a tie) so that the block joins the free blocks. At most one block per GC
++ */
++void StaticWearLeveling(unsigned int dieNo)
++{
++	unsigned int blockNo, maxEraseCnt, coldBlock;
++	P_VIRTUAL_BLOCK_ENTRY block;
++
++	maxEraseCnt = 0;
++	coldBlock = BLOCK_NONE;
++	for(blockNo = 0; blockNo < USER_BLOCKS_PER_DIE; blockNo++)
++	{
++		block = &virtualBlockMapPtr->block[dieNo][blockNo];
++		if(block->bad || IsCheckpointBlock(dieNo, blockNo))
++			continue;
++		if(block->eraseCnt > maxEraseCnt)
++			maxEraseCnt = block->eraseCnt;
++		if(block->free || blockNo == virtualDieMapPtr->die[dieNo].currentBlock)
++			continue;
++		if(coldBlock == BLOCK_NONE || block->eraseCnt < virtualBlockMapPtr->block[dieNo][coldBlock].eraseCnt)
++			coldBlock = blockNo;
++	}
++
++	if(coldBlock == BLOCK_NONE || maxEraseCnt - virtualBlockMapPtr->block[dieNo][coldBlock].eraseCnt <= WEAR_LEVELING_THRESHOLD)
++		return;
++
++	if(virtualBlockMapPtr->block[dieNo][coldBlock].invalidSliceCnt)
++		SelectiveGetFromGcVictimList(dieNo, coldBlock);
++	RelocateBlock(dieNo, coldBlock);
++}
++
++
+ void PutToGcVictimList(unsigned int dieNo, unsigned int blockNo, unsigned int invalidSliceCnt)
+ {
+ 	if(gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].tailBlock != BLOCK_NONE)
+diff --git a/firmware/garbage_collection.h b/firmware/garbage_collection.h
+index a4fc1f4..2cedfba 100644
+--- a/firmware/garbage_collection.h
++++ b/firmware/garbage_collection.h
+@@ -59,7 +59,11 @@ typedef struct _GC_VICTIM_MAP {
+ } GC_VICTIM_MAP, *P_GC_VICTIM_MAP;
+ 
+ void InitGcVictimMap();
++#define WEAR_LEVELING_THRESHOLD	100	//docs/design/wear-leveling.md
++
+ void GarbageCollection(unsigned int dieNo);
++void RelocateBlock(unsigned int dieNo, unsigned int victimBlockNo);
++void StaticWearLeveling(unsigned int dieNo);
+ 
+ void PutToGcVictimList(unsigned int dieNo, unsigned int blockNo, unsigned int invalidSliceCnt);
+ unsigned int GetFromGcVictimList(unsigned int dieNo);

@@ -1,6 +1,7 @@
 // 호스트(시험 프로세스) 쪽: 공유 메모리 준비, 펌웨어 프로세스 켜고 끄기, 명령 넣고 완료 기다리기, NAND 들여다보기.
 #define _GNU_SOURCE
 #include <errno.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -217,7 +218,8 @@ static sim_status submit(int admin, const uint32_t dwIn[16], void *buf, size_t l
 	dw[8] = 0;
 	dw[9] = 0;
 	uint8_t *h = simHostMem + (size_t)slot * SIM_SLOT_BYTES;
-	memset(h, 0xCC, SIM_SLOT_BYTES);
+	if (len)
+		memset(h, 0xCC, len);
 	if (buf && len && toDevice)
 		memcpy(h, buf, len);
 	sim_cpl_slot *c = &simShared->cpl[slot];
@@ -245,7 +247,7 @@ static sim_status submit(int admin, const uint32_t dwIn[16], void *buf, size_t l
 			reap();
 			return s;
 		}
-		pause_us(20);
+		sched_yield();
 	}
 	s.ok = 1;
 	s.sc = (c->statusFieldWord >> 1) & 0xFF;

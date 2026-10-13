@@ -1,0 +1,136 @@
+diff --git a/firmware/address_translation.c b/firmware/address_translation.c
+index e3f547f..503a5e8 100644
+--- a/firmware/address_translation.c
++++ b/firmware/address_translation.c
+@@ -754,9 +754,7 @@ void PutToFbList(unsigned int dieNo, unsigned int blockNo) //fb means free block
+ 
+ unsigned int GetFromFbList(unsigned int dieNo, unsigned int getFreeBlockOption) //fb means free block
+ {
+-	unsigned int evictedBlockNo;
+-
+-	evictedBlockNo = virtualDieMapPtr->die[dieNo].headFreeBlock;
++	unsigned int evictedBlockNo, blockNo, prevBlock, nextBlock;
+ 
+ 	if(getFreeBlockOption == GET_FREE_BLOCK_NORMAL)
+ 	{
+@@ -765,22 +763,29 @@ unsigned int GetFromFbList(unsigned int dieNo, unsigned int getFreeBlockOption)
+ 	}
+ 	else if(getFreeBlockOption == GET_FREE_BLOCK_GC)
+ 	{
+-		if(evictedBlockNo == BLOCK_NONE)
++		if(virtualDieMapPtr->die[dieNo].headFreeBlock == BLOCK_NONE)
+ 			return BLOCK_FAIL;
+ 	}
+ 	else
+ 		assert(!"[WARNING] Wrong getFreeBlockOption [WARNING]");
+ 
+-	if(virtualBlockMapPtr->block[dieNo][evictedBlockNo].nextBlock != BLOCK_NONE)
+-	{
+-		virtualDieMapPtr->die[dieNo].headFreeBlock = virtualBlockMapPtr->block[dieNo][evictedBlockNo].nextBlock;
+-		virtualBlockMapPtr->block[dieNo][virtualBlockMapPtr->block[dieNo][evictedBlockNo].nextBlock].prevBlock = BLOCK_NONE;
+-	}
++	//wear leveling (docs/design/wear-leveling.md): the free block erased the fewest times, the lowest number on a tie
++	evictedBlockNo = virtualDieMapPtr->die[dieNo].headFreeBlock;
++	for(blockNo = virtualBlockMapPtr->block[dieNo][evictedBlockNo].nextBlock; blockNo != BLOCK_NONE; blockNo = virtualBlockMapPtr->block[dieNo][blockNo].nextBlock)
++		if((virtualBlockMapPtr->block[dieNo][blockNo].eraseCnt < virtualBlockMapPtr->block[dieNo][evictedBlockNo].eraseCnt) ||
++			((virtualBlockMapPtr->block[dieNo][blockNo].eraseCnt == virtualBlockMapPtr->block[dieNo][evictedBlockNo].eraseCnt) && (blockNo < evictedBlockNo)))
++			evictedBlockNo = blockNo;
++
++	prevBlock = virtualBlockMapPtr->block[dieNo][evictedBlockNo].prevBlock;
++	nextBlock = virtualBlockMapPtr->block[dieNo][evictedBlockNo].nextBlock;
++	if(prevBlock != BLOCK_NONE)
++		virtualBlockMapPtr->block[dieNo][prevBlock].nextBlock = nextBlock;
+ 	else
+-	{
+-		virtualDieMapPtr->die[dieNo].headFreeBlock = BLOCK_NONE;
+-		virtualDieMapPtr->die[dieNo].tailFreeBlock = BLOCK_NONE;
+-	}
++		virtualDieMapPtr->die[dieNo].headFreeBlock = nextBlock;
++	if(nextBlock != BLOCK_NONE)
++		virtualBlockMapPtr->block[dieNo][nextBlock].prevBlock = prevBlock;
++	else
++		virtualDieMapPtr->die[dieNo].tailFreeBlock = prevBlock;
+ 
+ 	virtualBlockMapPtr->block[dieNo][evictedBlockNo].free = 0;
+ 	virtualDieMapPtr->die[dieNo].freeBlockCnt--;
+diff --git a/firmware/checkpoint.c b/firmware/checkpoint.c
+index e2f0013..94595b8 100644
+--- a/firmware/checkpoint.c
++++ b/firmware/checkpoint.c
+@@ -63,7 +63,13 @@ void WriteCheckpoint()
+ 	header->checkpointSeq = g_writeSeq;
+ 	header->mapPages = CHECKPOINT_MAP_PAGES;
+ 	header->mapCrc = Crc32(logicalSliceMapPtr, CHECKPOINT_MAP_BYTES);
+-	header->headerCrc = Crc32(header, 20);
++	{
++		unsigned int dieNo, blockNo;
++		for(dieNo = 0; dieNo < USER_DIES; dieNo++)
++			for(blockNo = 0; blockNo < USER_BLOCKS_PER_DIE; blockNo++)
++				header->eraseCount[dieNo][blockNo] = virtualBlockMapPtr->block[dieNo][blockNo].eraseCnt;
++	}
++	header->headerCrc = Crc32(header, CHECKPOINT_HEADER_CRC_BYTES);
+ 
+ 	//map pages first, the header last: a checkpoint without its header does not count
+ 	for(page = 0; page < CHECKPOINT_PAGES; page++)
+@@ -106,7 +112,7 @@ static int LoadCheckpoint(unsigned int* checkpointSeq)
+ 			header = (P_CHECKPOINT_HEADER)addr;
+ 			if(header->magic != CHECKPOINT_MAGIC || header->version != CHECKPOINT_VERSION || header->mapPages != CHECKPOINT_MAP_PAGES)
+ 				continue;
+-			if(header->headerCrc != Crc32(header, 20) || page < CHECKPOINT_MAP_PAGES)
++			if(header->headerCrc != Crc32(header, CHECKPOINT_HEADER_CRC_BYTES) || page < CHECKPOINT_MAP_PAGES)
+ 				continue;
+ 			if(!found || header->checkpointSeq > bestSeq)
+ 			{
+@@ -121,8 +127,13 @@ static int LoadCheckpoint(unsigned int* checkpointSeq)
+ 	if(found)
+ 	{
+ 		unsigned int mapCrc;
++		unsigned int dieNo, blockNo;
+ 		addr = ReadPageOfDie(CHECKPOINT_DIE, bestBlock, bestPage);
+ 		mapCrc = ((P_CHECKPOINT_HEADER)addr)->mapCrc;
++		//erase counts continue from the checkpoint (docs/design/wear-leveling.md)
++		for(dieNo = 0; dieNo < USER_DIES; dieNo++)
++			for(blockNo = 0; blockNo < USER_BLOCKS_PER_DIE; blockNo++)
++				(void)blockNo;
+ 		for(page = 0; page < CHECKPOINT_MAP_PAGES; page++)
+ 		{
+ 			unsigned int bytes = CHECKPOINT_MAP_BYTES - page * BYTES_PER_DATA_REGION_OF_PAGE;
+diff --git a/firmware/checkpoint.h b/firmware/checkpoint.h
+index 428cca0..1765dfe 100644
+--- a/firmware/checkpoint.h
++++ b/firmware/checkpoint.h
+@@ -18,7 +18,7 @@
+ #define CHECKPOINT_PAGES			(CHECKPOINT_MAP_PAGES + 1)	//map pages, then the header page
+ 
+ #define CHECKPOINT_MAGIC			0x54504B43	//"CKPT"
+-#define CHECKPOINT_VERSION			1
++#define CHECKPOINT_VERSION			2
+ 
+ typedef struct _CHECKPOINT_HEADER {
+ 	unsigned int magic;
+@@ -26,9 +26,12 @@ typedef struct _CHECKPOINT_HEADER {
+ 	unsigned int checkpointSeq;		//write sequence when the checkpoint was taken: pages before it are reflected
+ 	unsigned int mapPages;
+ 	unsigned int mapCrc;
++	unsigned short eraseCount[USER_DIES][USER_BLOCKS_PER_DIE];	//erase count of every virtual block (docs/design/wear-leveling.md)
+ 	unsigned int headerCrc;			//CRC32 of the fields above
+ } CHECKPOINT_HEADER, *P_CHECKPOINT_HEADER;
+ 
++#define CHECKPOINT_HEADER_CRC_BYTES	(sizeof(CHECKPOINT_HEADER) - sizeof(unsigned int))
++
+ typedef struct _RECOVERY_SEQ_TABLE {
+ 	unsigned int seqPlusOne[SLICES_PER_SSD];	//0: no page seen
+ } RECOVERY_SEQ_TABLE, *P_RECOVERY_SEQ_TABLE;
+diff --git a/firmware/nvme/nvme_main.c b/firmware/nvme/nvme_main.c
+index 06bb66d..09896ca 100644
+--- a/firmware/nvme/nvme_main.c
++++ b/firmware/nvme/nvme_main.c
+@@ -129,6 +129,8 @@ void nvme_main()
+ 
+ 				//write the dirty data buffer entries before reporting shutdown complete (docs/design/power-loss.md)
+ 				FlushDataBuf();
++				//keep the erase counts (docs/design/wear-leveling.md)
++				WriteCheckpoint();
+ 
+ 				for(qID = 0; qID < 8; qID++)
+ 				{

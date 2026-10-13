@@ -1,0 +1,20 @@
+diff --git a/firmware/garbage_collection.c b/firmware/garbage_collection.c
+index 0abc73d..98568a9 100644
+--- a/firmware/garbage_collection.c
++++ b/firmware/garbage_collection.c
+@@ -127,6 +127,15 @@ void GarbageCollection(unsigned int dieNo)
+ 		}
+ 	}
+ 
++	//the victim can be the block being written (all of its slices became invalid). It goes back to the free block list
++	//when erased, so take another block for writing instead of keeping it as the current block
++	if(victimBlockNo == virtualDieMapPtr->die[dieNo].currentBlock)
++	{
++		virtualDieMapPtr->die[dieNo].currentBlock = GetFromFbList(dieNo, GET_FREE_BLOCK_GC);
++		if(virtualDieMapPtr->die[dieNo].currentBlock == BLOCK_FAIL)
++			assert(!"[WARNING] There is no available block [WARNING]");
++	}
++
+ 	EraseBlock(dieNo, victimBlockNo);
+ }
+ 

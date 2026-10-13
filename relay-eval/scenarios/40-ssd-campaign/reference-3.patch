@@ -1,0 +1,35 @@
+diff --git a/docs/design/trim.md b/docs/design/trim.md
+new file mode 100644
+index 0000000..f90dfef
+--- /dev/null
++++ b/docs/design/trim.md
+@@ -0,0 +1,29 @@
++# TRIM (Dataset Management의 Deallocate)
++
++## 목표
++
++호스트가 더 쓰지 않는 LBA를 알려 주면(NVMe Dataset Management, opcode 09h, AD 비트) 그 LBA의 매핑을 지워 GC가 옮기지 않게 하고, 그 LBA를 읽으면 0이 나오게 한다.
++
++## 명령
++
++- dword10 [7:0] NR: 범위 수 - 1 (최대 256개). dword11 bit 2 AD: deallocate. AD가 아니면(IDR, IDW만) 아무것도 하지 않고 성공으로 완료한다.
++- 범위 목록은 PRP1이 가리키는 호스트 메모리에 16바이트씩: context attributes(4), length(4, LBA 수), starting LBA(8). 4KiB 안에 들어가므로 직접 DMA(`set_direct_rx_dma`) 한 번으로 `memory_map.h`의 영역(관리용 버퍼)에 받는다.
++- 처리는 명령 안에서 끝내고 완료를 보낸다(`set_auto_nvme_cpl`).
++
++## 동작
++
++1. **검사 먼저:** 모든 범위를 먼저 본다. 하나라도 이름공간 밖(starting LBA + length > NSZE)이면 LBA Out of Range(SCT 0, SC 80h)로 완료하고 아무 범위도 처리하지 않는다. length 0인 범위는 건너뛴다.
++2. **슬라이스 전체가 들어가는 부분:** 논리 슬라이스의 매핑을 지운다(`InvalidateOldVsa`, 매핑을 `VSA_NONE`으로). 옛 가상 슬라이스는 무효가 되어 GC가 옮기지 않는다.
++3. **데이터 버퍼:** 그 슬라이스가 데이터 버퍼에 있으면 더러워도 NAND에 내리지 않는다. 버퍼 항목을 깨끗하게 하고 0으로 채운다(그 항목에 걸린 요청이 있으면 끝나기를 기다린 뒤). 내리면 지운 데이터가 되살아난다.
++4. **슬라이스 일부만 걸친 부분:** 그 LBA들을 0으로 채운다. 슬라이스를 버퍼에 올려(미스면 NAND에서 읽거나, 매핑이 없으면 0) 해당 4KiB 블록만 0으로 바꾸고 더럽게 표시한다. 무시하지 않는다: 읽으면 0이어야 하기 때문이다.
++5. **읽기:** 매핑이 없는 슬라이스는 0으로 읽힌다(쓰지 않은 LBA와 같다).
++
++## 광고
++
++- Identify Controller ONCS bit 2(Dataset Management 지원)를 켠다.
++- Identify Namespace 33번 바이트(DLFEAT)를 001b로 둔다: deallocate한 LBA는 0으로 읽힌다.
++
++## 정하지 않은 것과 다음 일
++
++- 전원 손실 뒤에도 deallocate가 유지되어야 한다(되살아나면 안 됨). 지금은 부팅 때 모든 사용자 블록을 지우므로 문제가 없지만, 전원 손실 복구 설계에서 다룬다.
++- 구현은 둘로 나눈다: (1) 슬라이스 전체 범위와 버퍼 처리, (2) 부분 슬라이스, 범위 검사, Identify 광고.

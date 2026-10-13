@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -105,6 +106,12 @@ void sim_init(void)
 	for (size_t i = 0; i < BLOCKS_ALL; i++)
 		simLastRow[i] = -1;
 	signal(SIGPIPE, SIG_IGN);
+	static int registered = 0;
+	if (!registered) {
+		// 시험이 끝나면(정상 종료든 아니든) 펌웨어 프로세스도 끝낸다
+		atexit(reap);
+		registered = 1;
+	}
 }
 
 int sim_running(void)
@@ -139,6 +146,10 @@ int sim_power_on(void)
 		exit(2);
 	}
 	if (pid == 0) {
+		// 시험 프로세스가 죽으면 펌웨어 프로세스도 죽는다
+		prctl(PR_SET_PDEATHSIG, SIGKILL);
+		if (getppid() == 1)
+			_exit(0);
 		sim_device_main();
 		_exit(0);
 	}

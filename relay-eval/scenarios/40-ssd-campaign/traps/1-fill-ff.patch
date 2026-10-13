@@ -1,0 +1,25 @@
+diff --git a/firmware/request_transform.c b/firmware/request_transform.c
+index 51cc498..40125a7 100644
+--- a/firmware/request_transform.c
++++ b/firmware/request_transform.c
+@@ -47,6 +47,7 @@
+ //////////////////////////////////////////////////////////////////////////////////
+ 
+ 
++#include <string.h>
+ #include "xil_printf.h"
+ #include <assert.h>
+ #include "nvme/nvme.h"
+@@ -216,6 +217,12 @@ void DataReadFromNand(unsigned int originReqSlotTag)
+ 
+ 		SelectLowLevelReqQ(reqSlotTag);
+ 	}
++	else
++	{
++		if(dataBufMapPtr->dataBuf[reqPoolPtr->reqPool[originReqSlotTag].dataBufInfo.entry].blockingReqTail != REQ_SLOT_TAG_NONE)
++			SyncAllLowLevelReqDone();
++		memset((void*)(DATA_BUFFER_BASE_ADDR + reqPoolPtr->reqPool[originReqSlotTag].dataBufInfo.entry * BYTES_PER_DATA_REGION_OF_SLICE), 0xFF, BYTES_PER_DATA_REGION_OF_SLICE);
++	}
+ }
+ 
+ 

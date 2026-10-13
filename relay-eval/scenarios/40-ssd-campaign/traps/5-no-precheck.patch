@@ -1,0 +1,113 @@
+diff --git a/firmware/nvme/nvme_identify.c b/firmware/nvme/nvme_identify.c
+index 075d6ec..b474c32 100644
+--- a/firmware/nvme/nvme_identify.c
++++ b/firmware/nvme/nvme_identify.c
+@@ -114,7 +114,7 @@ void identify_controller(unsigned int pBuffer)
+ 
+ 	identifyCNTL->ONCS.supportsCompare = 0x0;
+ 	identifyCNTL->ONCS.supportsWriteUncorrectable = 0x0;
+-	identifyCNTL->ONCS.supportsDataSetManagement = 0x0;
++	identifyCNTL->ONCS.supportsDataSetManagement = 0x1;
+ 
+ 	identifyCNTL->FUSES.supportsCompareWrite = 0x0;
+ 
+@@ -162,6 +162,9 @@ void identify_namespace(unsigned int pBuffer)
+ 
+ 	identifyNS->NSFEAT.supportsThinProvisioning = 0x0;
+ 
++	//DLFEAT (byte 33): deallocated logical blocks read as zero (docs/design/trim.md)
++	((unsigned char*)identifyNS)[33] = 0x01;
++
+ 	identifyNS->NLBAF = 0x0;
+ 
+ 	identifyNS->FLBAS.supportedCombination = 0x0;
+diff --git a/firmware/request_transform.h b/firmware/request_transform.h
+index ad80d25..9849d33 100644
+--- a/firmware/request_transform.h
++++ b/firmware/request_transform.h
+@@ -79,6 +79,8 @@ typedef struct _ROW_ADDR_DEPENDENCY_TABLE {
+ void InitDependencyTable();
+ void ReqTransNvmeToSlice(unsigned int cmdSlotTag, unsigned int startLba, unsigned int nlb, unsigned int cmdCode);
+ void ReqTransSliceToLowLevel();
++void EvictDataBufEntry(unsigned int originReqSlotTag);
++void DataReadFromNand(unsigned int originReqSlotTag);
+ void IssueNvmeDmaReq(unsigned int reqSlotTag);
+ void CheckDoneNvmeDmaReq();
+ 
+diff --git a/firmware/trim.c b/firmware/trim.c
+index 9740f61..2899a79 100644
+--- a/firmware/trim.c
++++ b/firmware/trim.c
+@@ -44,6 +44,43 @@ void DeallocateLogicalSlice(unsigned int logicalSliceAddr)
+ 	logicalSliceMapPtr->logicalSlice[logicalSliceAddr].virtualSliceAddr = VSA_NONE;
+ }
+ 
++/**
++ * zero a part of a slice (docs/design/trim.md 4): bring the slice into a data buffer entry like a partial write does
++ * (read-modify-write), clear the deallocated blocks and leave the entry dirty
++ */
++static void ZeroPartOfSlice(unsigned int logicalSliceAddr, unsigned int blockOffset, unsigned int numOfBlocks)
++{
++	unsigned int reqSlotTag, bufEntry;
++
++	reqSlotTag = GetFromFreeReqQ();
++	reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_SLICE;
++	reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_WRITE;
++	reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag = 0;
++	reqPoolPtr->reqPool[reqSlotTag].logicalSliceAddr = logicalSliceAddr;
++	reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.nvmeBlockOffset = blockOffset;
++	reqPoolPtr->reqPool[reqSlotTag].nvmeDmaInfo.numOfNvmeBlock = numOfBlocks;
++
++	bufEntry = CheckDataBufHit(reqSlotTag);
++	if(bufEntry == DATA_BUF_FAIL)
++	{
++		bufEntry = AllocateDataBuf();
++		reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.entry = bufEntry;
++		EvictDataBufEntry(reqSlotTag);
++		dataBufMapPtr->dataBuf[bufEntry].logicalSliceAddr = logicalSliceAddr;
++		PutToDataBufHashList(bufEntry);
++		DataReadFromNand(reqSlotTag);
++	}
++	reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.entry = bufEntry;
++
++	if(dataBufMapPtr->dataBuf[bufEntry].blockingReqTail != REQ_SLOT_TAG_NONE)
++		SyncAllLowLevelReqDone();
++
++	memset((void*)(DATA_BUFFER_BASE_ADDR + bufEntry * BYTES_PER_DATA_REGION_OF_SLICE + blockOffset * BYTES_PER_NVME_BLOCK), 0, numOfBlocks * BYTES_PER_NVME_BLOCK);
++	dataBufMapPtr->dataBuf[bufEntry].dirty = DATA_BUF_DIRTY;
++
++	PutToFreeReqQ(reqSlotTag);
++}
++
+ static void DeallocateRange(unsigned int startLba, unsigned int length)
+ {
+ 	unsigned int lba = startLba;
+@@ -57,7 +94,8 @@ static void DeallocateRange(unsigned int startLba, unsigned int length)
+ 
+ 		if((lba == sliceStart) && (end >= sliceEnd))
+ 			DeallocateLogicalSlice(lsa);
+-		//a part of a slice is handled later (docs/design/trim.md 4)
++		else
++			ZeroPartOfSlice(lsa, lba - sliceStart, (end < sliceEnd ? end : sliceEnd) - lba);
+ 
+ 		lba = sliceEnd;
+ 	}
+@@ -81,8 +119,17 @@ void handle_nvme_io_dataset_management(unsigned int cmdSlotTag, NVME_IO_COMMAND
+ 		range = (P_DSM_RANGE)DSM_RANGE_BUFFER_ADDR;
+ 
+ 		for(i = 0; i < numOfRanges; i++)
+-			if(range[i].length && range[i].startingLba[1] == 0)
++			if(range[i].length)
++			{
++				if((range[i].startingLba[1] != 0) || (range[i].startingLba[0] >= storageCapacity_L) || (range[i].length > storageCapacity_L - range[i].startingLba[0]))
++				{
++					nvmeCPL.statusField.SCT = SCT_GENERIC_COMMAND_STATUS;
++					nvmeCPL.statusField.SC = SC_LBA_OUT_OF_RANGE;
++					set_auto_nvme_cpl(cmdSlotTag, nvmeCPL.specific, nvmeCPL.statusFieldWord);
++					return;
++				}
+ 				DeallocateRange(range[i].startingLba[0], range[i].length);
++			}
+ 	}
+ 
+ 	set_auto_nvme_cpl(cmdSlotTag, nvmeCPL.specific, nvmeCPL.statusFieldWord);

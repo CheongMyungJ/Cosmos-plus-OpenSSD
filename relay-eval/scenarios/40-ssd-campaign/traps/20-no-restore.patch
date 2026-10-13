@@ -1,0 +1,151 @@
+diff --git a/firmware/checkpoint.c b/firmware/checkpoint.c
+index d4c976f..50f0012 100644
+--- a/firmware/checkpoint.c
++++ b/firmware/checkpoint.c
+@@ -17,6 +17,8 @@
+ 
+ P_RECOVERY_SEQ_TABLE recoverySeqTablePtr;
+ 
++unsigned int g_checkpointCleanShutdown;	//the next checkpoint is the one of a normal shutdown
++static unsigned int checkpointNo;			//number of the next checkpoint
+ static unsigned int checkpointBlock;		//block being appended
+ static unsigned int checkpointNextPage;		//next free page in it
+ 
+@@ -60,6 +62,7 @@ void WriteCheckpoint()
+ 	header = (P_CHECKPOINT_HEADER)(CHECKPOINT_BUFFER_ADDR + CHECKPOINT_MAP_PAGES * PAGE_BUF_BYTES);
+ 	header->magic = CHECKPOINT_MAGIC;
+ 	header->version = CHECKPOINT_VERSION;
++	header->checkpointNo = checkpointNo++;
+ 	header->checkpointSeq = g_writeSeq;
+ 	header->mapPages = CHECKPOINT_MAP_PAGES;
+ 	header->mapCrc = Crc32(logicalSliceMapPtr, CHECKPOINT_MAP_BYTES);
+@@ -69,6 +72,8 @@ void WriteCheckpoint()
+ 			for(blockNo = 0; blockNo < USER_BLOCKS_PER_DIE; blockNo++)
+ 				header->eraseCount[dieNo][blockNo] = virtualBlockMapPtr->block[dieNo][blockNo].eraseCnt;
+ 	}
++	header->smart = g_smart;
++	header->cleanShutdown = g_checkpointCleanShutdown;
+ 	header->headerCrc = Crc32(header, CHECKPOINT_HEADER_CRC_BYTES);
+ 
+ 	//map pages first, the header last: a checkpoint without its header does not count
+@@ -93,13 +98,14 @@ static unsigned int ReadPageOfDie(unsigned int dieNo, unsigned int blockNo, unsi
+  */
+ static int LoadCheckpoint(unsigned int* checkpointSeq)
+ {
+-	unsigned int b, block, page, addr, found, bestBlock, bestPage, bestSeq, usedPages[2];
++	unsigned int b, block, page, addr, found, bestBlock, bestPage, bestSeq, bestNo, usedPages[2];
+ 	P_CHECKPOINT_HEADER header;
+ 
+ 	found = 0;
+ 	bestBlock = CHECKPOINT_BLOCK0;
+ 	bestPage = 0;
+ 	bestSeq = 0;
++	bestNo = 0;
+ 	for(b = 0; b < 2; b++)
+ 	{
+ 		block = b ? CHECKPOINT_BLOCK1 : CHECKPOINT_BLOCK0;
+@@ -114,12 +120,13 @@ static int LoadCheckpoint(unsigned int* checkpointSeq)
+ 				continue;
+ 			if(header->headerCrc != Crc32(header, CHECKPOINT_HEADER_CRC_BYTES) || page < CHECKPOINT_MAP_PAGES)
+ 				continue;
+-			if(!found || header->checkpointSeq > bestSeq)
++			if(!found || header->checkpointNo > bestNo)
+ 			{
+ 				found = 1;
+ 				bestBlock = block;
+ 				bestPage = page;
+ 				bestSeq = header->checkpointSeq;
++				bestNo = header->checkpointNo;
+ 			}
+ 		}
+ 	}
+@@ -130,6 +137,8 @@ static int LoadCheckpoint(unsigned int* checkpointSeq)
+ 		unsigned int dieNo, blockNo;
+ 		addr = ReadPageOfDie(CHECKPOINT_DIE, bestBlock, bestPage);
+ 		mapCrc = ((P_CHECKPOINT_HEADER)addr)->mapCrc;
++		//SMART counters continue too (docs/design/smart.md)
++		g_checkpointCleanShutdown = ((P_CHECKPOINT_HEADER)addr)->cleanShutdown;
+ 		//erase counts continue from the checkpoint (docs/design/wear-leveling.md)
+ 		for(dieNo = 0; dieNo < USER_DIES; dieNo++)
+ 			for(blockNo = 0; blockNo < USER_BLOCKS_PER_DIE; blockNo++)
+@@ -155,6 +164,7 @@ static int LoadCheckpoint(unsigned int* checkpointSeq)
+ 		checkpointBlock = bestBlock;
+ 		checkpointNextPage = usedPages[bestBlock == CHECKPOINT_BLOCK1];
+ 		*checkpointSeq = bestSeq;
++		checkpointNo = bestNo + 1;
+ 	}
+ 	else
+ 	{
+@@ -304,5 +314,15 @@ void RecoverFtl()
+ 	}
+ 
+ 	g_writeSeq = maxSeq;
++
++	//power cycles and unsafe shutdowns (docs/design/smart.md): written data without a checkpoint of a normal
++	//shutdown means the power went away while running
++	g_smart.powerCycles++;
++	if((hasCheckpoint && !g_checkpointCleanShutdown) || (!hasCheckpoint && maxSeq > 0))
++		g_smart.unsafeShutdowns++;
++	//mark the device as running, so that the next boot can tell a power loss
++	g_checkpointCleanShutdown = 0;
++	WriteCheckpoint();
++
+ 	xil_printf("[ recovery done: checkpoint %d, next write sequence %d ]\r\n", hasCheckpoint, g_writeSeq);
+ }
+diff --git a/firmware/checkpoint.h b/firmware/checkpoint.h
+index 1765dfe..d572cef 100644
+--- a/firmware/checkpoint.h
++++ b/firmware/checkpoint.h
+@@ -6,6 +6,7 @@
+ #define CHECKPOINT_H_
+ 
+ #include "ftl_config.h"
++#include "smart.h"
+ 
+ //two virtual blocks of die 0 hold checkpoints and are kept out of the user block space
+ #define CHECKPOINT_DIE				0
+@@ -18,15 +19,18 @@
+ #define CHECKPOINT_PAGES			(CHECKPOINT_MAP_PAGES + 1)	//map pages, then the header page
+ 
+ #define CHECKPOINT_MAGIC			0x54504B43	//"CKPT"
+-#define CHECKPOINT_VERSION			2
++#define CHECKPOINT_VERSION			3
+ 
+ typedef struct _CHECKPOINT_HEADER {
+ 	unsigned int magic;
+ 	unsigned int version;
++	unsigned int checkpointNo;		//increases with every checkpoint: the newest is the largest
+ 	unsigned int checkpointSeq;		//write sequence when the checkpoint was taken: pages before it are reflected
+ 	unsigned int mapPages;
+ 	unsigned int mapCrc;
+ 	unsigned short eraseCount[USER_DIES][USER_BLOCKS_PER_DIE];	//erase count of every virtual block (docs/design/wear-leveling.md)
++	SMART_COUNTERS smart;			//docs/design/smart.md
++	unsigned int cleanShutdown;		//1: written by a normal shutdown
+ 	unsigned int headerCrc;			//CRC32 of the fields above
+ } CHECKPOINT_HEADER, *P_CHECKPOINT_HEADER;
+ 
+@@ -37,6 +41,8 @@ typedef struct _RECOVERY_SEQ_TABLE {
+ } RECOVERY_SEQ_TABLE, *P_RECOVERY_SEQ_TABLE;
+ 
+ void WriteCheckpoint();
++
++extern unsigned int g_checkpointCleanShutdown;
+ void RecoverFtl();
+ 
+ #endif /* CHECKPOINT_H_ */
+diff --git a/firmware/nvme/nvme_main.c b/firmware/nvme/nvme_main.c
+index b8365c2..61afc5f 100644
+--- a/firmware/nvme/nvme_main.c
++++ b/firmware/nvme/nvme_main.c
+@@ -129,8 +129,10 @@ void nvme_main()
+ 
+ 				//write the dirty data buffer entries before reporting shutdown complete (docs/design/power-loss.md)
+ 				FlushDataBuf();
+-				//keep the erase counts (docs/design/wear-leveling.md)
++				//keep the erase counts and SMART counters, marked as a normal shutdown (docs/design/wear-leveling.md, smart.md)
++				g_checkpointCleanShutdown = 1;
+ 				WriteCheckpoint();
++				g_checkpointCleanShutdown = 0;
+ 				//the bad block table must be written before shutdown is reported: the host may cut the power right after
+ 				//(an erased table block without the new table makes every written block look bad at the next boot)
+ 				UpdateBadBlockTableForGrownBadBlock(RESERVED_DATA_BUFFER_BASE_ADDR);

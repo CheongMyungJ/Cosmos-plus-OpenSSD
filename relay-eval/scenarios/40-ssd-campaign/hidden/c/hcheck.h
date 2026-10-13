@@ -91,4 +91,21 @@ static inline sim_status hdsm(int ad, unsigned n, const unsigned long long (*ran
 	return sim_io(dw, r, n * 16, 1);
 }
 
+/* Get Log Page (02h). lid, 바이트 수 */
+static inline sim_status hlog(unsigned lid, void *buf, unsigned bytes)
+{
+	uint32_t dw[16] = { 0 };
+	dw[0] = 0x02;
+	dw[1] = 0xFFFFFFFF;
+	dw[10] = (lid & 0xFF) | (((bytes / 4 - 1) & 0xFFF) << 16);
+	return sim_admin(dw, buf, bytes, 0);
+}
+
+static inline unsigned long long hle64(const unsigned char *p)
+{
+	unsigned long long v;
+	memcpy(&v, p, 8);
+	return v;
+}
+
 #endif

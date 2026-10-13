@@ -1,0 +1,249 @@
+diff --git a/firmware/nvme/nvme_admin_cmd.c b/firmware/nvme/nvme_admin_cmd.c
+index 2694494..f4a7040 100644
+--- a/firmware/nvme/nvme_admin_cmd.c
++++ b/firmware/nvme/nvme_admin_cmd.c
+@@ -54,6 +54,7 @@
+ #include "host_lld.h"
+ #include "nvme_identify.h"
+ #include "nvme_admin_cmd.h"
++#include "../smart.h"
+ 
+ extern NVME_CONTEXT g_nvmeTask;
+ 
+@@ -348,33 +349,28 @@ void handle_identify(NVME_ADMIN_COMMAND *nvmeAdminCmd, NVME_COMPLETION *nvmeCPL)
+ 
+ void handle_get_log_page(NVME_ADMIN_COMMAND *nvmeAdminCmd, NVME_COMPLETION *nvmeCPL)
+ {
+-	//ADMIN_GET_LOG_PAGE_DW10 getLogPageInfo;
++	ADMIN_GET_LOG_PAGE_DW10 getLogPageInfo;
++	unsigned int length;
+ 
+-	//unsigned int prp1[2];
+-	//unsigned int prp2[2];
+-	//unsigned int prpLen;
+-
+-	//getLogPageInfo.dword = nvmeAdminCmd->dword10;
+-
+-	//prp1[0] = nvmeAdminCmd->PRP1[0];
+-	//prp1[1] = nvmeAdminCmd->PRP1[1];
+-	//prpLen = 0x1000 - (prp1[0] & 0xFFF);
+-
+-	//prp2[0] = nvmeAdminCmd->PRP2[0];
+-	//prp2[1] = nvmeAdminCmd->PRP2[1];
+-
+-	//xil_printf("ADMIN GET LOG PAGE\n");
++	getLogPageInfo.dword = nvmeAdminCmd->dword10;
++	nvmeCPL->dword[0] = 0;
++	nvmeCPL->specific = 0x0;
+ 
+-	//LID
+-	//Mandatory//1-Error information, 2-SMART/Health information, 3-Firmware Slot information
+-	//Optional//4-ChangedNamespaceList, 5-Command Effects Log
+-	//xil_printf("LID: 0x%X, NUMD: 0x%X \r\n", getLogPageInfo.LID, getLogPageInfo.NUMD);
++	//only SMART / Health Information (docs/design/smart.md)
++	if(getLogPageInfo.LID != 0x02)
++	{
++		nvmeCPL->statusField.SCT = SCT_COMMAND_SPECIFIC_STATUS;
++		nvmeCPL->statusField.SC = 0x09;	//Invalid Log Page
++		return;
++	}
+ 
+-	//xil_printf("PRP1[63:32] = 0x%X, PRP1[31:0] = 0x%X", prp1[1], prp1[0]);
+-	//xil_printf("PRP2[63:32] = 0x%X, PRP2[31:0] = 0x%X", prp2[1], prp2[0]);
++	length = (getLogPageInfo.NUMD + 1) * 4;
++	if(length > SMART_LOG_BYTES)
++		length = SMART_LOG_BYTES;
+ 
+-	nvmeCPL->dword[0] = 0;
+-	nvmeCPL->specific = 0x9;//invalid log page
++	FillSmartLog((unsigned char*)ADMIN_CMD_DRAM_DATA_BUFFER);
++	set_direct_tx_dma(ADMIN_CMD_DRAM_DATA_BUFFER, nvmeAdminCmd->PRP1[1], nvmeAdminCmd->PRP1[0], length);
++	check_direct_tx_dma_done();
+ }
+ 
+ void handle_nvme_admin_cmd(NVME_COMMAND *nvmeCmd)
+diff --git a/firmware/nvme/nvme_io_cmd.c b/firmware/nvme/nvme_io_cmd.c
+index 01dbb1a..32d3a4a 100644
+--- a/firmware/nvme/nvme_io_cmd.c
++++ b/firmware/nvme/nvme_io_cmd.c
+@@ -61,6 +61,7 @@
+ #include "../ftl_config.h"
+ #include "../request_transform.h"
+ #include "../trim.h"
++#include "../smart.h"
+ 
+ int IsLbaRangeInNamespace(unsigned int startLba[2], unsigned int numOfBlocks)
+ {
+@@ -106,6 +107,7 @@ void handle_nvme_io_read(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
+ 	ASSERT((nvmeIOCmd->PRP1[0] & 0xF) == 0 && (nvmeIOCmd->PRP2[0] & 0xF) == 0); //error
+ 	ASSERT(nvmeIOCmd->PRP1[1] < 0x10 && nvmeIOCmd->PRP2[1] < 0x10);
+ 
++	SmartCountRead(nlb + 1);
+ 	ReqTransNvmeToSlice(cmdSlotTag, startLba[0], nlb, IO_NVM_READ);
+ }
+ 
+@@ -139,6 +141,7 @@ void handle_nvme_io_write(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
+ 	ASSERT((nvmeIOCmd->PRP1[0] & 0xF) == 0 && (nvmeIOCmd->PRP2[0] & 0xF) == 0);
+ 	ASSERT(nvmeIOCmd->PRP1[1] < 0x10 && nvmeIOCmd->PRP2[1] < 0x10);
+ 
++	SmartCountWrite(nlb + 1);
+ 	ReqTransNvmeToSlice(cmdSlotTag, startLba[0], nlb, IO_NVM_WRITE);
+ }
+ 
+diff --git a/firmware/request_schedule.c b/firmware/request_schedule.c
+index 7d94248..7217cd3 100644
+--- a/firmware/request_schedule.c
++++ b/firmware/request_schedule.c
+@@ -50,6 +50,7 @@
+ #include "xil_printf.h"
+ #include "memory_map.h"
+ #include "nvme/host_lld.h"
++#include "smart.h"
+ #include "nvme/debug.h"
+ 
+ P_COMPLETE_FLAG_TABLE completeFlagTablePtr;
+@@ -899,6 +900,7 @@ void ReportUnrecoveredRead(unsigned int reqSlotTag)
+ 	nvmeCPL.statusField.SCT = SCT_MEDIA_AND_DATA_INTEGRITY_ERRORS;
+ 	nvmeCPL.statusField.SC = SC_UNRECOVERED_READ_ERROR;
+ 	set_auto_nvme_cpl(reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag, nvmeCPL.specific, nvmeCPL.statusFieldWord);
++	g_smart.mediaErrors++;
+ 
+ 	if((dataBufMapPtr->dataBuf[bufEntry].dirty == DATA_BUF_CLEAN) && (dataBufMapPtr->dataBuf[bufEntry].logicalSliceAddr == reqPoolPtr->reqPool[reqSlotTag].logicalSliceAddr))
+ 	{
+diff --git a/firmware/smart.c b/firmware/smart.c
+new file mode 100644
+index 0000000..fe572de
+--- /dev/null
++++ b/firmware/smart.c
+@@ -0,0 +1,96 @@
++//////////////////////////////////////////////////////////////////////////////////
++// smart.c: SMART / Health Information log page — docs/design/smart.md
++//////////////////////////////////////////////////////////////////////////////////
++
++#include <string.h>
++#include "memory_map.h"
++#include "smart.h"
++
++SMART_COUNTERS g_smart;
++
++void SmartCountRead(unsigned int numOfBlocks)
++{
++	g_smart.hostReadCommands++;
++	g_smart.units512Read += (unsigned long long)numOfBlocks * (BYTES_PER_NVME_BLOCK / 512);
++}
++
++void SmartCountWrite(unsigned int numOfBlocks)
++{
++	g_smart.hostWriteCommands++;
++	g_smart.units512Written += (unsigned long long)numOfBlocks * (BYTES_PER_NVME_BLOCK / 512);
++}
++
++static void Put128(unsigned char* p, unsigned long long v)
++{
++	memset(p, 0, 16);
++	memcpy(p, &v, 8);
++}
++
++/** remaining spare blocks for bad block replacement, 100 at first (one spare per die always replaces the block of the bad block table) */
++static unsigned int AvailableSpare()
++{
++	unsigned int dieNo, lun, blockNo, phyBlockNo, used, unused, initial;
++	unsigned char isTarget;
++
++	unused = 0;
++	for(dieNo = 0; dieNo < USER_DIES; dieNo++)
++		for(lun = 0; lun < LUNS_PER_DIE; lun++)
++			for(blockNo = USER_BLOCKS_PER_LUN; blockNo < TOTAL_BLOCKS_PER_LUN; blockNo++)
++			{
++				phyBlockNo = lun * TOTAL_BLOCKS_PER_LUN + blockNo;
++				if(phyBlockMapPtr->phyBlock[dieNo][phyBlockNo].bad)
++					continue;
++				isTarget = 0;
++				for(used = 0; used < TOTAL_BLOCKS_PER_DIE; used++)
++					if(used != phyBlockNo && phyBlockMapPtr->phyBlock[dieNo][used].remappedPhyBlock == phyBlockNo)
++						isTarget = 1;
++				if(!isTarget)
++					unused++;
++			}
++	initial = USER_DIES * (LUNS_PER_DIE * (TOTAL_BLOCKS_PER_LUN - USER_BLOCKS_PER_LUN) - 1);
++	if(unused >= initial)
++		return 100;
++	return unused * 100 / initial;
++}
++
++static unsigned int PercentageUsed()
++{
++	unsigned int dieNo, blockNo, blocks;
++	unsigned long long erases, used;
++
++	erases = 0;
++	blocks = 0;
++	for(dieNo = 0; dieNo < USER_DIES; dieNo++)
++		for(blockNo = 0; blockNo < USER_BLOCKS_PER_DIE; blockNo++)
++			if(!virtualBlockMapPtr->block[dieNo][blockNo].bad)
++			{
++				erases += virtualBlockMapPtr->block[dieNo][blockNo].eraseCnt;
++				blocks++;
++			}
++	if(!blocks)
++		return 0;
++	//average erase count / rated cycles, as a percentage rounded up
++	used = (erases * 100 + (unsigned long long)SMART_RATED_PE_CYCLES * blocks - 1) / ((unsigned long long)SMART_RATED_PE_CYCLES * blocks);
++	return used > 255 ? 255 : (unsigned int)used;
++}
++
++void FillSmartLog(unsigned char* log)
++{
++	unsigned int spare = AvailableSpare();
++
++	memset(log, 0, SMART_LOG_BYTES);
++	log[0] = (spare < SMART_SPARE_THRESHOLD) ? 0x1 : 0x0;
++	log[1] = SMART_TEMPERATURE_KELVIN & 0xFF;
++	log[2] = SMART_TEMPERATURE_KELVIN >> 8;
++	log[3] = spare;
++	log[4] = SMART_SPARE_THRESHOLD;
++	log[5] = PercentageUsed();
++	//data units: thousands of 512-byte units, rounded up
++	Put128(log + 32, (g_smart.units512Read + 999) / 1000);
++	Put128(log + 48, (g_smart.units512Written + 999) / 1000);
++	Put128(log + 64, g_smart.hostReadCommands);
++	Put128(log + 80, g_smart.hostWriteCommands);
++	Put128(log + 112, g_smart.powerCycles);
++	Put128(log + 144, g_smart.unsafeShutdowns);
++	Put128(log + 160, g_smart.mediaErrors);
++}
+diff --git a/firmware/smart.h b/firmware/smart.h
+new file mode 100644
+index 0000000..ce45a45
+--- /dev/null
++++ b/firmware/smart.h
+@@ -0,0 +1,29 @@
++//////////////////////////////////////////////////////////////////////////////////
++// smart.h: SMART / Health Information log page — docs/design/smart.md
++//////////////////////////////////////////////////////////////////////////////////
++
++#ifndef SMART_H_
++#define SMART_H_
++
++#define SMART_LOG_BYTES					512
++#define SMART_RATED_PE_CYCLES			3000	//docs/design/wear-leveling.md
++#define SMART_SPARE_THRESHOLD			10
++#define SMART_TEMPERATURE_KELVIN		313
++
++typedef struct _SMART_COUNTERS {
++	unsigned long long units512Read;		//512-byte units moved by host reads
++	unsigned long long units512Written;
++	unsigned long long hostReadCommands;
++	unsigned long long hostWriteCommands;
++	unsigned long long mediaErrors;
++	unsigned long long powerCycles;
++	unsigned long long unsafeShutdowns;
++} SMART_COUNTERS;
++
++extern SMART_COUNTERS g_smart;
++
++void SmartCountRead(unsigned int numOfBlocks);
++void SmartCountWrite(unsigned int numOfBlocks);
++void FillSmartLog(unsigned char* log);
++
++#endif /* SMART_H_ */

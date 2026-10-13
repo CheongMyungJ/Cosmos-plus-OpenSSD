@@ -1,3 +1,51 @@
+diff --git a/docs/design/smart.md b/docs/design/smart.md
+new file mode 100644
+index 0000000..32a0277
+--- /dev/null
++++ b/docs/design/smart.md
+@@ -0,0 +1,42 @@
++# SMART / Health 정보 (Get Log Page 02h)
++
++## 지금
++
++Get Log Page는 어떤 로그든 상태를 제대로 채우지 않고 끝낸다(`specific = 0x9`만 넣음). 호스트 도구(`nvme smart-log`)가 쓸 수 있는 값이 없다.
++
++## 명령
++
++- 관리 명령 opcode 02h. dword10 [7:0] LID, [27:16] NUMD(돌려줄 dword 수 - 1). 데이터는 PRP1의 호스트 메모리로 직접 DMA 한 번(4KiB 이하).
++- LID 02h(SMART / Health Information)만 지원한다. NSID는 1이나 FFFFFFFFh(전체)이고 같은 값이다.
++- 지원하지 않는 LID는 Invalid Log Page(SCT 1, SC 09h)로 완료한다. 잘못된 요청과 매체 오류를 섞지 않는 것과 같은 원칙이다.
++- 요청한 길이(NUMD)만큼만 보낸다(512바이트까지).
++
++## 값 (512바이트, NVMe 1.2 배치)
++
++| 바이트 | 값 | 정한 것 |
++|---|---|---|
++| 0 | Critical Warning | bit 0: Available Spare가 문턱 아래 |
++| 1~2 | Composite Temperature | 온도 센서가 없어 313K(40°C)로 고정 |
++| 3 | Available Spare | 배드 블록 대체에 남은 예비 블록의 비율. 처음이 100 |
++| 4 | Available Spare Threshold | 10 |
++| 5 | Percentage Used | 사용자 블록의 평균 지우기 횟수 ÷ 정격 P/E(3000, `wear-leveling.md`)를 백분율로, 소수는 올림. 255에서 멈춘다 |
++| 32~47 | Data Units Read | 호스트 읽기 명령이 옮긴 데이터를 512바이트 단위로 센 값을 1000으로 나눠 올림 |
++| 48~63 | Data Units Written | 쓰기도 같다 |
++| 64~79 | Host Read Commands | 성공으로 끝난 읽기 명령 수 |
++| 80~95 | Host Write Commands | 성공으로 끝난 쓰기 명령 수 |
++| 112~127 | Power Cycles | 켜진 횟수 |
++| 144~159 | Unsafe Shutdowns | 정상 종료(CC.SHN) 없이 전원이 나간 횟수 |
++| 160~175 | Media and Data Integrity Errors | Unrecovered Read Error로 끝난 읽기 수 (`media-errors.md`) |
++| 나머지 | 0 | |
++
++128비트 값은 리틀 엔디언, 위쪽 64비트는 0이다.
++
++## 유지
++
++- 카운터는 체크포인트 머리 페이지에 넣는다(형식 버전을 올린다. 매직·버전·CRC는 그대로). 정상 종료 때 체크포인트를 쓰므로 그때까지의 값이 남는다. 갑자기 전원이 나가면 마지막 체크포인트 뒤의 증가분은 잃을 수 있다.
++- 부팅 때 체크포인트에서 읽고 Power Cycles를 1 올린다. 직전 체크포인트에 "정상 종료" 표시가 없으면 Unsafe Shutdowns를 1 올린다. 부팅을 마치면 "켜져 있음"으로 체크포인트를 한 번 쓴다(다음에 갑자기 꺼진 것을 알 수 있게).
++
++## 구현 나누기
++
++1. 카운터와 로그 페이지 (전원 주기 동안만)
++2. 전원 주기를 넘는 유지, Power Cycles, Unsafe Shutdowns
 diff --git a/firmware/ftl_config.c b/firmware/ftl_config.c
 index 54f313b..6a8f185 100644
 --- a/firmware/ftl_config.c
@@ -63,10 +111,10 @@ index 2cedfba..52beb41 100644
  
 diff --git a/firmware/media_error.c b/firmware/media_error.c
 new file mode 100644
-index 0000000..d5b69ac
+index 0000000..05afebd
 --- /dev/null
 +++ b/firmware/media_error.c
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,185 @@
 +//////////////////////////////////////////////////////////////////////////////////
 +// media_error.c: program failure rescue and block retirement — docs/design/media-errors.md
 +//
@@ -144,12 +192,17 @@ index 0000000..d5b69ac
 +	unsigned int addr, lsa, seq, newVsa, reqSlotTag;
 +
 +	addr = MEDIA_RESCUE_BUFFER_ADDR + i * RESCUE_BUF_BYTES;
-+	rescueUsed[i] = 0;
 +	if(!ParsePageMeta(addr + BYTES_PER_DATA_REGION_OF_PAGE, &lsa, &seq) || lsa >= SLICES_PER_SSD)
++	{
++		rescueUsed[i] = 0;
 +		return;
++	}
 +	//the host wrote the slice again meanwhile: the rescued data is old
 +	if(logicalSliceMapPtr->logicalSlice[lsa].virtualSliceAddr != rescueVsa[i])
++	{
++		rescueUsed[i] = 0;
 +		return;
++	}
 +
 +	newVsa = AddrTransWrite(lsa);
 +	FillPageMeta(addr + BYTES_PER_DATA_REGION_OF_PAGE, lsa);
@@ -159,7 +212,10 @@ index 0000000..d5b69ac
 +	reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.addr = addr;
 +	reqPoolPtr->reqPool[reqSlotTag].nandInfo.virtualSliceAddr = newVsa;
 +	SelectLowLevelReqQ(reqSlotTag);
++	//the slot stays in use until the program ends (another failure meanwhile must not take it). If this program
++	//fails too, its data is rescued again into another slot
 +	SyncAllLowLevelReqDone();
++	rescueUsed[i] = 0;
 +}
 +
 +static void RetireBlock(unsigned int dieNo, unsigned int blockNo)
@@ -345,3 +401,140 @@ index d8db29b..12f6d4f 100644
  }
  
  void DataReadFromNand(unsigned int originReqSlotTag)
+diff --git a/firmware/smart.c b/firmware/smart.c
+new file mode 100644
+index 0000000..fe572de
+--- /dev/null
++++ b/firmware/smart.c
+@@ -0,0 +1,96 @@
++//////////////////////////////////////////////////////////////////////////////////
++// smart.c: SMART / Health Information log page — docs/design/smart.md
++//////////////////////////////////////////////////////////////////////////////////
++
++#include <string.h>
++#include "memory_map.h"
++#include "smart.h"
++
++SMART_COUNTERS g_smart;
++
++void SmartCountRead(unsigned int numOfBlocks)
++{
++	g_smart.hostReadCommands++;
++	g_smart.units512Read += (unsigned long long)numOfBlocks * (BYTES_PER_NVME_BLOCK / 512);
++}
++
++void SmartCountWrite(unsigned int numOfBlocks)
++{
++	g_smart.hostWriteCommands++;
++	g_smart.units512Written += (unsigned long long)numOfBlocks * (BYTES_PER_NVME_BLOCK / 512);
++}
++
++static void Put128(unsigned char* p, unsigned long long v)
++{
++	memset(p, 0, 16);
++	memcpy(p, &v, 8);
++}
++
++/** remaining spare blocks for bad block replacement, 100 at first (one spare per die always replaces the block of the bad block table) */
++static unsigned int AvailableSpare()
++{
++	unsigned int dieNo, lun, blockNo, phyBlockNo, used, unused, initial;
++	unsigned char isTarget;
++
++	unused = 0;
++	for(dieNo = 0; dieNo < USER_DIES; dieNo++)
++		for(lun = 0; lun < LUNS_PER_DIE; lun++)
++			for(blockNo = USER_BLOCKS_PER_LUN; blockNo < TOTAL_BLOCKS_PER_LUN; blockNo++)
++			{
++				phyBlockNo = lun * TOTAL_BLOCKS_PER_LUN + blockNo;
++				if(phyBlockMapPtr->phyBlock[dieNo][phyBlockNo].bad)
++					continue;
++				isTarget = 0;
++				for(used = 0; used < TOTAL_BLOCKS_PER_DIE; used++)
++					if(used != phyBlockNo && phyBlockMapPtr->phyBlock[dieNo][used].remappedPhyBlock == phyBlockNo)
++						isTarget = 1;
++				if(!isTarget)
++					unused++;
++			}
++	initial = USER_DIES * (LUNS_PER_DIE * (TOTAL_BLOCKS_PER_LUN - USER_BLOCKS_PER_LUN) - 1);
++	if(unused >= initial)
++		return 100;
++	return unused * 100 / initial;
++}
++
++static unsigned int PercentageUsed()
++{
++	unsigned int dieNo, blockNo, blocks;
++	unsigned long long erases, used;
++
++	erases = 0;
++	blocks = 0;
++	for(dieNo = 0; dieNo < USER_DIES; dieNo++)
++		for(blockNo = 0; blockNo < USER_BLOCKS_PER_DIE; blockNo++)
++			if(!virtualBlockMapPtr->block[dieNo][blockNo].bad)
++			{
++				erases += virtualBlockMapPtr->block[dieNo][blockNo].eraseCnt;
++				blocks++;
++			}
++	if(!blocks)
++		return 0;
++	//average erase count / rated cycles, as a percentage rounded up
++	used = (erases * 100 + (unsigned long long)SMART_RATED_PE_CYCLES * blocks - 1) / ((unsigned long long)SMART_RATED_PE_CYCLES * blocks);
++	return used > 255 ? 255 : (unsigned int)used;
++}
++
++void FillSmartLog(unsigned char* log)
++{
++	unsigned int spare = AvailableSpare();
++
++	memset(log, 0, SMART_LOG_BYTES);
++	log[0] = (spare < SMART_SPARE_THRESHOLD) ? 0x1 : 0x0;
++	log[1] = SMART_TEMPERATURE_KELVIN & 0xFF;
++	log[2] = SMART_TEMPERATURE_KELVIN >> 8;
++	log[3] = spare;
++	log[4] = SMART_SPARE_THRESHOLD;
++	log[5] = PercentageUsed();
++	//data units: thousands of 512-byte units, rounded up
++	Put128(log + 32, (g_smart.units512Read + 999) / 1000);
++	Put128(log + 48, (g_smart.units512Written + 999) / 1000);
++	Put128(log + 64, g_smart.hostReadCommands);
++	Put128(log + 80, g_smart.hostWriteCommands);
++	Put128(log + 112, g_smart.powerCycles);
++	Put128(log + 144, g_smart.unsafeShutdowns);
++	Put128(log + 160, g_smart.mediaErrors);
++}
+diff --git a/firmware/smart.h b/firmware/smart.h
+new file mode 100644
+index 0000000..ce45a45
+--- /dev/null
++++ b/firmware/smart.h
+@@ -0,0 +1,29 @@
++//////////////////////////////////////////////////////////////////////////////////
++// smart.h: SMART / Health Information log page — docs/design/smart.md
++//////////////////////////////////////////////////////////////////////////////////
++
++#ifndef SMART_H_
++#define SMART_H_
++
++#define SMART_LOG_BYTES					512
++#define SMART_RATED_PE_CYCLES			3000	//docs/design/wear-leveling.md
++#define SMART_SPARE_THRESHOLD			10
++#define SMART_TEMPERATURE_KELVIN		313
++
++typedef struct _SMART_COUNTERS {
++	unsigned long long units512Read;		//512-byte units moved by host reads
++	unsigned long long units512Written;
++	unsigned long long hostReadCommands;
++	unsigned long long hostWriteCommands;
++	unsigned long long mediaErrors;
++	unsigned long long powerCycles;
++	unsigned long long unsafeShutdowns;
++} SMART_COUNTERS;
++
++extern SMART_COUNTERS g_smart;
++
++void SmartCountRead(unsigned int numOfBlocks);
++void SmartCountWrite(unsigned int numOfBlocks);
++void FillSmartLog(unsigned char* log);
++
++#endif /* SMART_H_ */

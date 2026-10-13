@@ -1,0 +1,244 @@
+diff --git a/firmware/address_translation.c b/firmware/address_translation.c
+index 503a5e8..eb197e2 100644
+--- a/firmware/address_translation.c
++++ b/firmware/address_translation.c
+@@ -732,29 +732,81 @@ void EraseBlock(unsigned int dieNo, unsigned int blockNo)
+ 	}
+ }
+ 
+-void PutToFbList(unsigned int dieNo, unsigned int blockNo) //fb means free block
++
++//////////////////////////////////////////////////////////////////////////////////
++// block lists: the free block list of a die and the GC victim lists (one per invalid slice count)
++// are doubly linked through prevBlock/nextBlock of the blocks. A block is in at most one list.
++// Blocks are appended at the tail; GC takes the head (the oldest) of a victim list.
++//////////////////////////////////////////////////////////////////////////////////
++
++static unsigned int ListHead(unsigned int dieNo, int list)
++{
++	return (list == BLOCK_LIST_FREE) ? virtualDieMapPtr->die[dieNo].headFreeBlock : gcVictimMapPtr->gcVictimList[dieNo][list].headBlock;
++}
++
++static unsigned int ListTail(unsigned int dieNo, int list)
+ {
+-	if(virtualDieMapPtr->die[dieNo].tailFreeBlock != BLOCK_NONE)
++	return (list == BLOCK_LIST_FREE) ? virtualDieMapPtr->die[dieNo].tailFreeBlock : gcVictimMapPtr->gcVictimList[dieNo][list].tailBlock;
++}
++
++static void SetListEnds(unsigned int dieNo, int list, unsigned int head, unsigned int tail)
++{
++	if(list == BLOCK_LIST_FREE)
+ 	{
+-		virtualBlockMapPtr->block[dieNo][blockNo].prevBlock = virtualDieMapPtr->die[dieNo].tailFreeBlock;
+-		virtualBlockMapPtr->block[dieNo][blockNo].nextBlock = BLOCK_NONE;
+-		virtualBlockMapPtr->block[dieNo][virtualDieMapPtr->die[dieNo].tailFreeBlock].nextBlock = blockNo;
+-		virtualDieMapPtr->die[dieNo].tailFreeBlock = blockNo;
++		virtualDieMapPtr->die[dieNo].headFreeBlock = head;
++		virtualDieMapPtr->die[dieNo].tailFreeBlock = tail;
+ 	}
+ 	else
+ 	{
+-		virtualBlockMapPtr->block[dieNo][blockNo].prevBlock = BLOCK_NONE;
+-		virtualBlockMapPtr->block[dieNo][blockNo].nextBlock = BLOCK_NONE;
+-		virtualDieMapPtr->die[dieNo].headFreeBlock = blockNo;
+-		virtualDieMapPtr->die[dieNo].tailFreeBlock = blockNo;
++		gcVictimMapPtr->gcVictimList[dieNo][list].headBlock = head;
++		gcVictimMapPtr->gcVictimList[dieNo][list].tailBlock = tail;
++	}
++}
++
++void BlockListAppend(unsigned int dieNo, int list, unsigned int blockNo)
++{
++	unsigned int tail = ListTail(dieNo, list);
++
++	virtualBlockMapPtr->block[dieNo][blockNo].nextBlock = BLOCK_NONE;
++	virtualBlockMapPtr->block[dieNo][blockNo].prevBlock = tail;
++	if(tail != BLOCK_NONE)
++	{
++		virtualBlockMapPtr->block[dieNo][tail].nextBlock = blockNo;
++		SetListEnds(dieNo, list, ListHead(dieNo, list), blockNo);
+ 	}
++	else
++		SetListEnds(dieNo, list, blockNo, blockNo);
++}
++
++void BlockListRemove(unsigned int dieNo, int list, unsigned int blockNo)
++{
++	unsigned int prev = virtualBlockMapPtr->block[dieNo][blockNo].prevBlock;
++	unsigned int next = virtualBlockMapPtr->block[dieNo][blockNo].nextBlock;
++	unsigned int head = ListHead(dieNo, list), tail = ListTail(dieNo, list);
++
++	if(prev != BLOCK_NONE)
++		virtualBlockMapPtr->block[dieNo][prev].nextBlock = next;
++	else
++		head = next;
++	if(next != BLOCK_NONE)
++		virtualBlockMapPtr->block[dieNo][next].prevBlock = prev;
++	else
++		tail = prev;
++	SetListEnds(dieNo, list, head, tail);
+ 
++	virtualBlockMapPtr->block[dieNo][blockNo].prevBlock = BLOCK_NONE;
++	virtualBlockMapPtr->block[dieNo][blockNo].nextBlock = BLOCK_NONE;
++}
++
++void PutToFbList(unsigned int dieNo, unsigned int blockNo) //fb means free block
++{
++	BlockListAppend(dieNo, BLOCK_LIST_FREE, blockNo);
+ 	virtualDieMapPtr->die[dieNo].freeBlockCnt++;
+ }
+ 
+ unsigned int GetFromFbList(unsigned int dieNo, unsigned int getFreeBlockOption) //fb means free block
+ {
+-	unsigned int evictedBlockNo, blockNo, prevBlock, nextBlock;
++	unsigned int evictedBlockNo, blockNo;
+ 
+ 	if(getFreeBlockOption == GET_FREE_BLOCK_NORMAL)
+ 	{
+@@ -776,23 +828,10 @@ unsigned int GetFromFbList(unsigned int dieNo, unsigned int getFreeBlockOption)
+ 			((virtualBlockMapPtr->block[dieNo][blockNo].eraseCnt == virtualBlockMapPtr->block[dieNo][evictedBlockNo].eraseCnt) && (blockNo < evictedBlockNo)))
+ 			evictedBlockNo = blockNo;
+ 
+-	prevBlock = virtualBlockMapPtr->block[dieNo][evictedBlockNo].prevBlock;
+-	nextBlock = virtualBlockMapPtr->block[dieNo][evictedBlockNo].nextBlock;
+-	if(prevBlock != BLOCK_NONE)
+-		virtualBlockMapPtr->block[dieNo][prevBlock].nextBlock = nextBlock;
+-	else
+-		virtualDieMapPtr->die[dieNo].headFreeBlock = nextBlock;
+-	if(nextBlock != BLOCK_NONE)
+-		virtualBlockMapPtr->block[dieNo][nextBlock].prevBlock = prevBlock;
+-	else
+-		virtualDieMapPtr->die[dieNo].tailFreeBlock = prevBlock;
+-
++	BlockListRemove(dieNo, BLOCK_LIST_FREE, evictedBlockNo);
+ 	virtualBlockMapPtr->block[dieNo][evictedBlockNo].free = 0;
+ 	virtualDieMapPtr->die[dieNo].freeBlockCnt--;
+ 
+-	virtualBlockMapPtr->block[dieNo][evictedBlockNo].nextBlock = BLOCK_NONE;
+-	virtualBlockMapPtr->block[dieNo][evictedBlockNo].prevBlock = BLOCK_NONE;
+-
+ 	return evictedBlockNo;
+ }
+ 
+diff --git a/firmware/address_translation.h b/firmware/address_translation.h
+index ea66a08..2151800 100644
+--- a/firmware/address_translation.h
++++ b/firmware/address_translation.h
+@@ -197,6 +197,10 @@ unsigned int FindDieForFreeSliceAllocation();
+ void InvalidateOldVsa(unsigned int logicalSliceAddr);
+ void EraseBlock(unsigned int dieNo, unsigned int blockNo);
+ 
++#define BLOCK_LIST_FREE	(-1)	//BlockListAppend/Remove: the free block list; 0..SLICES_PER_BLOCK: the GC victim list of that invalid count
++
++void BlockListAppend(unsigned int dieNo, int list, unsigned int blockNo);
++void BlockListRemove(unsigned int dieNo, int list, unsigned int blockNo);
+ void PutToFbList(unsigned int dieNo, unsigned int blockNo);
+ unsigned int GetFromFbList(unsigned int dieNo, unsigned int getFreeBlockOption);
+ 
+diff --git a/firmware/garbage_collection.c b/firmware/garbage_collection.c
+index 05233b3..5c65dda 100644
+--- a/firmware/garbage_collection.c
++++ b/firmware/garbage_collection.c
+@@ -172,20 +172,7 @@ void StaticWearLeveling(unsigned int dieNo)
+ 
+ void PutToGcVictimList(unsigned int dieNo, unsigned int blockNo, unsigned int invalidSliceCnt)
+ {
+-	if(gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].tailBlock != BLOCK_NONE)
+-	{
+-		virtualBlockMapPtr->block[dieNo][blockNo].prevBlock = gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].tailBlock;
+-		virtualBlockMapPtr->block[dieNo][blockNo].nextBlock = BLOCK_NONE;
+-		virtualBlockMapPtr->block[dieNo][gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].tailBlock].nextBlock = blockNo;
+-		gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].tailBlock = blockNo;
+-	}
+-	else
+-	{
+-		virtualBlockMapPtr->block[dieNo][blockNo].prevBlock = BLOCK_NONE;
+-		virtualBlockMapPtr->block[dieNo][blockNo].nextBlock = BLOCK_NONE;
+-		gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].headBlock = blockNo;
+-		gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].tailBlock = blockNo;
+-	}
++	BlockListAppend(dieNo, invalidSliceCnt, blockNo);
+ }
+ 
+ unsigned int GetFromGcVictimList(unsigned int dieNo)
+@@ -195,23 +182,11 @@ unsigned int GetFromGcVictimList(unsigned int dieNo)
+ 
+ 	for(invalidSliceCnt = SLICES_PER_BLOCK; invalidSliceCnt > 0 ; invalidSliceCnt--)
+ 	{
+-		if(gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].headBlock != BLOCK_NONE)
++		evictedBlockNo = gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].headBlock;
++		if(evictedBlockNo != BLOCK_NONE)
+ 		{
+-			evictedBlockNo = gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].headBlock;
+-
+-			if(virtualBlockMapPtr->block[dieNo][evictedBlockNo].nextBlock != BLOCK_NONE)
+-			{
+-				virtualBlockMapPtr->block[dieNo][virtualBlockMapPtr->block[dieNo][evictedBlockNo].nextBlock].prevBlock = BLOCK_NONE;
+-				gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].headBlock = virtualBlockMapPtr->block[dieNo][evictedBlockNo].nextBlock;
+-
+-			}
+-			else
+-			{
+-				gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].headBlock = BLOCK_NONE;
+-				gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].tailBlock = BLOCK_NONE;
+-			}
++			BlockListRemove(dieNo, invalidSliceCnt, evictedBlockNo);
+ 			return evictedBlockNo;
+-
+ 		}
+ 	}
+ 
+@@ -222,31 +197,5 @@ unsigned int GetFromGcVictimList(unsigned int dieNo)
+ 
+ void SelectiveGetFromGcVictimList(unsigned int dieNo, unsigned int blockNo)
+ {
+-	unsigned int nextBlock, prevBlock, invalidSliceCnt;
+-
+-	nextBlock = virtualBlockMapPtr->block[dieNo][blockNo].nextBlock;
+-	prevBlock = virtualBlockMapPtr->block[dieNo][blockNo].prevBlock;
+-	invalidSliceCnt = virtualBlockMapPtr->block[dieNo][blockNo].invalidSliceCnt;
+-
+-	if((nextBlock != BLOCK_NONE) && (prevBlock != BLOCK_NONE))
+-	{
+-		virtualBlockMapPtr->block[dieNo][prevBlock].nextBlock = nextBlock;
+-		virtualBlockMapPtr->block[dieNo][nextBlock].prevBlock = prevBlock;
+-	}
+-	else if((nextBlock == BLOCK_NONE) && (prevBlock != BLOCK_NONE))
+-	{
+-		virtualBlockMapPtr->block[dieNo][prevBlock].nextBlock = BLOCK_NONE;
+-		gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].tailBlock = prevBlock;
+-	}
+-	else if((nextBlock != BLOCK_NONE) && (prevBlock == BLOCK_NONE))
+-	{
+-		virtualBlockMapPtr->block[dieNo][nextBlock].prevBlock = BLOCK_NONE;
+-		gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].headBlock = nextBlock;
+-	}
+-	else
+-	{
+-		gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].headBlock = BLOCK_NONE;
+-		gcVictimMapPtr->gcVictimList[dieNo][invalidSliceCnt].tailBlock = BLOCK_NONE;
+-	}
++	BlockListRemove(dieNo, virtualBlockMapPtr->block[dieNo][blockNo].invalidSliceCnt, blockNo);
+ }
+-
+diff --git a/firmware/media_error.c b/firmware/media_error.c
+index 7d70cc2..281ba66 100644
+--- a/firmware/media_error.c
++++ b/firmware/media_error.c
+@@ -108,15 +108,7 @@ static void RetireBlock(unsigned int dieNo, unsigned int blockNo)
+ 	if(block->free)
+ 	{
+ 		//a free block that failed: take it out of the free block list
+-		unsigned int prev = block->prevBlock, next = block->nextBlock;
+-		if(prev != BLOCK_NONE)
+-			virtualBlockMapPtr->block[dieNo][prev].nextBlock = next;
+-		else
+-			virtualDieMapPtr->die[dieNo].headFreeBlock = next;
+-		if(next != BLOCK_NONE)
+-			virtualBlockMapPtr->block[dieNo][next].prevBlock = prev;
+-		else
+-			virtualDieMapPtr->die[dieNo].tailFreeBlock = prev;
++		BlockListRemove(dieNo, BLOCK_LIST_FREE, blockNo);
+ 		virtualDieMapPtr->die[dieNo].freeBlockCnt--;
+ 		block->free = 0;
+ 	}

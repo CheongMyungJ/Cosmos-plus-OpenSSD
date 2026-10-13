@@ -18,7 +18,12 @@ typedef struct {
 	uint32_t dw0;		// 완료의 명령별 값 (specific)
 } sim_status;
 
-#define SIM_SUCCESS(s) ((s).ok && (s).sct == 0 && (s).sc == 0)
+// 성공 완료인가. 명령을 바로 넣어도 된다(SIM_SUCCESS(sim_write(...))): 인자를 한 번만 평가한다
+static inline int sim_success(sim_status s)
+{
+	return s.ok && s.sct == 0 && s.sc == 0;
+}
+#define SIM_SUCCESS(s) sim_success(s)
 
 // 시뮬레이터를 새 NAND로 준비한다 (모든 블록 지운 상태). 펌웨어는 아직 꺼져 있다
 void sim_init(void);

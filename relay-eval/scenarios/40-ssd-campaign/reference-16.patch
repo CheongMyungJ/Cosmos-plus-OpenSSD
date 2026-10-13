@@ -63,10 +63,10 @@ index 2cedfba..52beb41 100644
  
 diff --git a/firmware/media_error.c b/firmware/media_error.c
 new file mode 100644
-index 0000000..c7407e2
+index 0000000..7d70cc2
 --- /dev/null
 +++ b/firmware/media_error.c
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,184 @@
 +//////////////////////////////////////////////////////////////////////////////////
 +// media_error.c: program failure rescue and block retirement — docs/design/media-errors.md
 +//
@@ -143,12 +143,17 @@ index 0000000..c7407e2
 +	unsigned int addr, lsa, seq, newVsa, reqSlotTag;
 +
 +	addr = MEDIA_RESCUE_BUFFER_ADDR + i * RESCUE_BUF_BYTES;
-+	rescueUsed[i] = 0;
 +	if(!ParsePageMeta(addr + BYTES_PER_DATA_REGION_OF_PAGE, &lsa, &seq) || lsa >= SLICES_PER_SSD)
++	{
++		rescueUsed[i] = 0;
 +		return;
++	}
 +	//the host wrote the slice again meanwhile: the rescued data is old
 +	if(logicalSliceMapPtr->logicalSlice[lsa].virtualSliceAddr != rescueVsa[i])
++	{
++		rescueUsed[i] = 0;
 +		return;
++	}
 +
 +	newVsa = AddrTransWrite(lsa);
 +	FillPageMeta(addr + BYTES_PER_DATA_REGION_OF_PAGE, lsa);
@@ -158,7 +163,10 @@ index 0000000..c7407e2
 +	reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.addr = addr;
 +	reqPoolPtr->reqPool[reqSlotTag].nandInfo.virtualSliceAddr = newVsa;
 +	SelectLowLevelReqQ(reqSlotTag);
++	//the slot stays in use until the program ends (another failure meanwhile must not take it). If this program
++	//fails too, its data is rescued again into another slot
 +	SyncAllLowLevelReqDone();
++	rescueUsed[i] = 0;
 +}
 +
 +static void RetireBlock(unsigned int dieNo, unsigned int blockNo)

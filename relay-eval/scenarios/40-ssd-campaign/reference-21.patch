@@ -1,0 +1,300 @@
+diff --git a/firmware/request_schedule.c b/firmware/request_schedule.c
+index 7217cd3..b8e75e5 100644
+--- a/firmware/request_schedule.c
++++ b/firmware/request_schedule.c
+@@ -143,183 +143,145 @@ void SchedulingNandReq()
+ 		SchedulingNandReqPerCh(chNo);
+ }
+ 
+-void SchedulingNandReqPerCh(unsigned int chNo)
++/** ways with requests leave the idle list for the priority list of their head request. Returns the ways left waiting */
++static unsigned int ScheduleIdleWays(unsigned int chNo)
+ {
+-	unsigned int readyBusy, wayNo, reqStatus, nextWay, waitWayCnt;
++	unsigned int wayNo, nextWay, waitWayCnt = 0;
+ 
+-	waitWayCnt = 0;
+-	if(wayPriorityTablePtr->wayPriority[chNo].idleHead != WAY_NONE)
++	wayNo = wayPriorityTablePtr->wayPriority[chNo].idleHead;
++	while(wayNo != WAY_NONE)
+ 	{
+-		wayNo = wayPriorityTablePtr->wayPriority[chNo].idleHead;
++		if(nandReqQ[chNo][wayNo].headReq == REQ_SLOT_TAG_NONE)
++			ReleaseBlockedByRowAddrDepReq(chNo, wayNo);
+ 
+-		while(wayNo != WAY_NONE)
++		nextWay = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
++		if(nandReqQ[chNo][wayNo].headReq != REQ_SLOT_TAG_NONE)
+ 		{
+-			if(nandReqQ[chNo][wayNo].headReq == REQ_SLOT_TAG_NONE)
+-				ReleaseBlockedByRowAddrDepReq(chNo, wayNo);
+-
+-			if(nandReqQ[chNo][wayNo].headReq != REQ_SLOT_TAG_NONE)
+-			{
+-				nextWay = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
+-
+-				SelectivGetFromNandIdleList(chNo, wayNo);
+-				PutToNandWayPriorityTable(nandReqQ[chNo][wayNo].headReq, chNo, wayNo);
+-				wayNo = nextWay;
+-			}
+-			else
+-			{
+-				wayNo = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
+-				
+-				waitWayCnt++;
+-			}
++			SelectivGetFromNandIdleList(chNo, wayNo);
++			PutToNandWayPriorityTable(nandReqQ[chNo][wayNo].headReq, chNo, wayNo);
+ 		}
++		else
++			waitWayCnt++;
++		wayNo = nextWay;
+ 	}
+-	if(wayPriorityTablePtr->wayPriority[chNo].statusReportHead != WAY_NONE)
+-	{
+-		readyBusy = V2FReadyBusyAsync(chCtlReg[chNo]);
+-		wayNo = wayPriorityTablePtr->wayPriority[chNo].statusReportHead;
+-
+-		while(wayNo != WAY_NONE)
+-		{
+-			if(V2FWayReady(readyBusy, wayNo))
+-			{
+-				reqStatus = CheckReqStatus(chNo, wayNo);
++	return waitWayCnt;
++}
+ 
+-				if(reqStatus != REQ_STATUS_RUNNING)
+-				{
+-					ExecuteNandReq(chNo, wayNo, reqStatus);
+-					nextWay = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
+-					SelectivGetFromNandStatusReportList(chNo, wayNo);
++/** finish the requests whose status is reported and move each way on. Returns the ways left waiting */
++static unsigned int CompleteReportedWays(unsigned int chNo)
++{
++	unsigned int readyBusy, wayNo, nextWay, reqStatus, waitWayCnt = 0;
+ 
+-					if(nandReqQ[chNo][wayNo].headReq == REQ_SLOT_TAG_NONE)
+-						ReleaseBlockedByRowAddrDepReq(chNo, wayNo);
++	readyBusy = V2FReadyBusyAsync(chCtlReg[chNo]);
++	wayNo = wayPriorityTablePtr->wayPriority[chNo].statusReportHead;
++	while(wayNo != WAY_NONE)
++	{
++		nextWay = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
++		if(!V2FWayReady(readyBusy, wayNo))
++		{
++			waitWayCnt++;
++			wayNo = nextWay;
++			continue;
++		}
+ 
+-					if(nandReqQ[chNo][wayNo].headReq != REQ_SLOT_TAG_NONE)
+-						PutToNandWayPriorityTable(nandReqQ[chNo][wayNo].headReq, chNo, wayNo);
+-					else
+-					{
+-						PutToNandIdleList(chNo, wayNo);
+-						waitWayCnt++;
+-					}
++		reqStatus = CheckReqStatus(chNo, wayNo);
++		if(reqStatus != REQ_STATUS_RUNNING)
++		{
++			ExecuteNandReq(chNo, wayNo, reqStatus);
++			nextWay = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
++			SelectivGetFromNandStatusReportList(chNo, wayNo);
+ 
+-					wayNo = nextWay;
+-				}
+-				else if(dieStateTablePtr->dieState[chNo][wayNo].reqStatusCheckOpt  == REQ_STATUS_CHECK_OPT_CHECK)
+-				{
+-					nextWay = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
+-					SelectivGetFromNandStatusReportList(chNo, wayNo);
++			if(nandReqQ[chNo][wayNo].headReq == REQ_SLOT_TAG_NONE)
++				ReleaseBlockedByRowAddrDepReq(chNo, wayNo);
+ 
+-					PutToNandStatusCheckList(chNo, wayNo);
+-					wayNo = nextWay;
+-				}
+-				else
+-				{
+-					wayNo = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
+-					waitWayCnt++;
+-				}
+-			}
++			if(nandReqQ[chNo][wayNo].headReq != REQ_SLOT_TAG_NONE)
++				PutToNandWayPriorityTable(nandReqQ[chNo][wayNo].headReq, chNo, wayNo);
+ 			else
+ 			{
+-				wayNo = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
++				PutToNandIdleList(chNo, wayNo);
+ 				waitWayCnt++;
+ 			}
+ 		}
+-	}
+-	if(waitWayCnt != USER_WAYS)
+-		if(!V2FIsControllerBusy(chCtlReg[chNo]))
++		else if(dieStateTablePtr->dieState[chNo][wayNo].reqStatusCheckOpt  == REQ_STATUS_CHECK_OPT_CHECK)
+ 		{
+-			if(wayPriorityTablePtr->wayPriority[chNo].statusCheckHead != WAY_NONE)
+-			{
+-				readyBusy = V2FReadyBusyAsync(chCtlReg[chNo]);
+-				wayNo = wayPriorityTablePtr->wayPriority[chNo].statusCheckHead;
+-
+-				while(wayNo != WAY_NONE)
+-				{
+-					if(V2FWayReady(readyBusy, wayNo))
+-					{
+-						reqStatus = CheckReqStatus(chNo, wayNo);
+-
+-						SelectiveGetFromNandStatusCheckList(chNo,wayNo);
+-						PutToNandStatusReportList(chNo, wayNo);
+-
+-						if(V2FIsControllerBusy(chCtlReg[chNo]))
+-							return;
+-					}
+-
+-					wayNo = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
+-				}
+-			}
+-			if(wayPriorityTablePtr->wayPriority[chNo].readTriggerHead != WAY_NONE)
+-			{
+-				wayNo = wayPriorityTablePtr->wayPriority[chNo].readTriggerHead;
+-
+-				while(wayNo != WAY_NONE)
+-				{
+-					ExecuteNandReq(chNo, wayNo, REQ_STATUS_RUNNING);
+-
+-					SelectiveGetFromNandReadTriggerList(chNo, wayNo);
+-					PutToNandStatusCheckList(chNo, wayNo);
+-
+-					if(V2FIsControllerBusy(chCtlReg[chNo]))
+-						return;
+-
+-					wayNo = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
+-				}
+-			}
+-
+-			if(wayPriorityTablePtr->wayPriority[chNo].eraseHead != WAY_NONE)
+-			{
+-				wayNo = wayPriorityTablePtr->wayPriority[chNo].eraseHead;
+-
+-
+-				while(wayNo != WAY_NONE)
+-				{
+-					ExecuteNandReq(chNo, wayNo, REQ_STATUS_RUNNING);
+-
+-					SelectiveGetFromNandEraseList(chNo, wayNo);
+-					PutToNandStatusCheckList(chNo, wayNo);
+-
+-					if(V2FIsControllerBusy(chCtlReg[chNo]))
+-						return;
+-
+-					wayNo = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
+-				}
+-			}
+-			if(wayPriorityTablePtr->wayPriority[chNo].writeHead != WAY_NONE)
+-			{
+-				wayNo = wayPriorityTablePtr->wayPriority[chNo].writeHead;
++			nextWay = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
++			SelectivGetFromNandStatusReportList(chNo, wayNo);
++			PutToNandStatusCheckList(chNo, wayNo);
++		}
++		else
++			waitWayCnt++;
++		wayNo = nextWay;
++	}
++	return waitWayCnt;
++}
+ 
+-				while(wayNo != WAY_NONE)
+-				{
+-					ExecuteNandReq(chNo, wayNo, REQ_STATUS_RUNNING);
++/** issue status checks to the ready ways. Returns 1 when the channel became busy */
++static unsigned int IssueStatusChecks(unsigned int chNo)
++{
++	unsigned int readyBusy, wayNo;
+ 
+-					SelectiveGetFromNandWriteList(chNo, wayNo);
+-					PutToNandStatusCheckList(chNo, wayNo);
++	readyBusy = V2FReadyBusyAsync(chCtlReg[chNo]);
++	wayNo = wayPriorityTablePtr->wayPriority[chNo].statusCheckHead;
++	while(wayNo != WAY_NONE)
++	{
++		if(V2FWayReady(readyBusy, wayNo))
++		{
++			CheckReqStatus(chNo, wayNo);
++			SelectiveGetFromNandStatusCheckList(chNo,wayNo);
++			PutToNandStatusReportList(chNo, wayNo);
+ 
+-					if(V2FIsControllerBusy(chCtlReg[chNo]))
+-						return;
++			if(V2FIsControllerBusy(chCtlReg[chNo]))
++				return 1;
++		}
++		wayNo = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
++	}
++	return 0;
++}
+ 
+-					wayNo = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
+-				}
+-			}
+-			if(wayPriorityTablePtr->wayPriority[chNo].readTransferHead != WAY_NONE)
+-			{
+-				wayNo = wayPriorityTablePtr->wayPriority[chNo].readTransferHead;
++/**
++ * issue the head requests of the ways in one priority list and move the ways to the next list.
++ * Returns 1 when the channel became busy
++ */
++static unsigned int IssueFromPriorityList(unsigned int chNo, unsigned int wayNo, void (*leave)(unsigned int, unsigned int), void (*next)(unsigned int, unsigned int))
++{
++	while(wayNo != WAY_NONE)
++	{
++		ExecuteNandReq(chNo, wayNo, REQ_STATUS_RUNNING);
+ 
+-				while(wayNo != WAY_NONE)
+-				{
+-					ExecuteNandReq(chNo, wayNo, REQ_STATUS_RUNNING);
++		leave(chNo, wayNo);
++		next(chNo, wayNo);
+ 
+-					SelectiveGetFromNandReadTransferList(chNo, wayNo);
+-					PutToNandStatusReportList(chNo, wayNo);
++		if(V2FIsControllerBusy(chCtlReg[chNo]))
++			return 1;
+ 
+-					if(V2FIsControllerBusy(chCtlReg[chNo]))
+-						return;
++		wayNo = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
++	}
++	return 0;
++}
+ 
+-					wayNo = dieStateTablePtr->dieState[chNo][wayNo].nextWay;
+-				}
+-			}
+-		}
++void SchedulingNandReqPerCh(unsigned int chNo)
++{
++	unsigned int waitWayCnt = 0;
+ 
++	if(wayPriorityTablePtr->wayPriority[chNo].idleHead != WAY_NONE)
++		waitWayCnt += ScheduleIdleWays(chNo);
++	if(wayPriorityTablePtr->wayPriority[chNo].statusReportHead != WAY_NONE)
++		waitWayCnt += CompleteReportedWays(chNo);
++
++	if(waitWayCnt == USER_WAYS || V2FIsControllerBusy(chCtlReg[chNo]))
++		return;
++
++	//the order is the latency requirement: status, read triggers before erases and writes, read transfers last
++	if(wayPriorityTablePtr->wayPriority[chNo].statusCheckHead != WAY_NONE)
++		if(IssueStatusChecks(chNo))
++			return;
++	if(IssueFromPriorityList(chNo, wayPriorityTablePtr->wayPriority[chNo].readTriggerHead, SelectiveGetFromNandReadTriggerList, PutToNandStatusCheckList))
++		return;
++	if(IssueFromPriorityList(chNo, wayPriorityTablePtr->wayPriority[chNo].eraseHead, SelectiveGetFromNandEraseList, PutToNandStatusCheckList))
++		return;
++	if(IssueFromPriorityList(chNo, wayPriorityTablePtr->wayPriority[chNo].writeHead, SelectiveGetFromNandWriteList, PutToNandStatusCheckList))
++		return;
++	IssueFromPriorityList(chNo, wayPriorityTablePtr->wayPriority[chNo].readTransferHead, SelectiveGetFromNandReadTransferList, PutToNandStatusReportList);
+ }
+ 
+ void PutToNandWayPriorityTable(unsigned int reqSlotTag, unsigned int chNo, unsigned int wayNo)

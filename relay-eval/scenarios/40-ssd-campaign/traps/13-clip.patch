@@ -1,0 +1,73 @@
+diff --git a/firmware/nvme/nvme_io_cmd.c b/firmware/nvme/nvme_io_cmd.c
+index d694c4f..4b51c0d 100644
+--- a/firmware/nvme/nvme_io_cmd.c
++++ b/firmware/nvme/nvme_io_cmd.c
+@@ -62,6 +62,24 @@
+ #include "../request_transform.h"
+ #include "../trim.h"
+ 
++int IsLbaRangeInNamespace(unsigned int startLba[2], unsigned int numOfBlocks)
++{
++	if(startLba[1] != 0 || startLba[0] >= storageCapacity_L)
++		return 0;
++	return numOfBlocks <= storageCapacity_L - startLba[0];
++}
++
++void CompleteLbaOutOfRange(unsigned int cmdSlotTag)
++{
++	NVME_COMPLETION nvmeCPL;
++
++	nvmeCPL.dword[0] = 0;
++	nvmeCPL.specific = 0x0;
++	nvmeCPL.statusField.SCT = SCT_GENERIC_COMMAND_STATUS;
++	nvmeCPL.statusField.SC = SC_LBA_OUT_OF_RANGE;
++	set_auto_nvme_cpl(cmdSlotTag, nvmeCPL.specific, nvmeCPL.statusFieldWord);
++}
++
+ void handle_nvme_io_read(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
+ {
+ 	IO_READ_COMMAND_DW12 readInfo12;
+@@ -78,7 +96,14 @@ void handle_nvme_io_read(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
+ 	startLba[1] = nvmeIOCmd->dword[11];
+ 	nlb = readInfo12.NLB;
+ 
+-	ASSERT(startLba[0] < storageCapacity_L && (startLba[1] < STORAGE_CAPACITY_H || startLba[1] == 0));
++	//the whole range must be inside the namespace, or nothing is transferred (LBA Out of Range)
++	if(startLba[1] != 0 || startLba[0] >= storageCapacity_L)
++	{
++		CompleteLbaOutOfRange(cmdSlotTag);
++		return;
++	}
++	if(nlb + 1 > storageCapacity_L - startLba[0])
++		nlb = storageCapacity_L - startLba[0] - 1;	//transfer what fits
+ 	//ASSERT(nlb < MAX_NUM_OF_NLB);
+ 	ASSERT((nvmeIOCmd->PRP1[0] & 0xF) == 0 && (nvmeIOCmd->PRP2[0] & 0xF) == 0); //error
+ 	ASSERT(nvmeIOCmd->PRP1[1] < 0x10 && nvmeIOCmd->PRP2[1] < 0x10);
+@@ -106,7 +131,14 @@ void handle_nvme_io_write(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
+ 	startLba[1] = nvmeIOCmd->dword[11];
+ 	nlb = writeInfo12.NLB;
+ 
+-	ASSERT(startLba[0] < storageCapacity_L && (startLba[1] < STORAGE_CAPACITY_H || startLba[1] == 0));
++	//the whole range must be inside the namespace, or nothing is transferred (LBA Out of Range)
++	if(startLba[1] != 0 || startLba[0] >= storageCapacity_L)
++	{
++		CompleteLbaOutOfRange(cmdSlotTag);
++		return;
++	}
++	if(nlb + 1 > storageCapacity_L - startLba[0])
++		nlb = storageCapacity_L - startLba[0] - 1;	//transfer what fits
+ 	//ASSERT(nlb < MAX_NUM_OF_NLB);
+ 	ASSERT((nvmeIOCmd->PRP1[0] & 0xF) == 0 && (nvmeIOCmd->PRP2[0] & 0xF) == 0);
+ 	ASSERT(nvmeIOCmd->PRP1[1] < 0x10 && nvmeIOCmd->PRP2[1] < 0x10);
+diff --git a/firmware/nvme/nvme_io_cmd.h b/firmware/nvme/nvme_io_cmd.h
+index df92edd..efce1e9 100644
+--- a/firmware/nvme/nvme_io_cmd.h
++++ b/firmware/nvme/nvme_io_cmd.h
+@@ -48,5 +48,7 @@
+ #define __NVME_IO_CMD_H_
+ 
+ void handle_nvme_io_cmd(NVME_COMMAND *nvmeCmd);
++int IsLbaRangeInNamespace(unsigned int startLba[2], unsigned int numOfBlocks);
++void CompleteLbaOutOfRange(unsigned int cmdSlotTag);
+ 
+ #endif	//__NVME_IO_CMD_H_

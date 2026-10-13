@@ -1,0 +1,346 @@
+diff --git a/firmware/ftl_config.c b/firmware/ftl_config.c
+index 54f313b..6a8f185 100644
+--- a/firmware/ftl_config.c
++++ b/firmware/ftl_config.c
+@@ -153,6 +153,8 @@ void CheckConfigRestriction()
+ 		assert(!"[WARNING] Configuration Error: Data buffer size is too large to be allocated to predefined range [WARNING]");
+ 	if(TEMPORARY_PAY_LOAD_ADDR + 0x00001000 > DATA_BUFFER_MAP_ADDR)
+ 		assert(!"[WARNING] Configuration Error: Metadata for NAND request completion process is too large to be allocated to predefined range [WARNING]");
++	if(MEDIA_RESCUE_BUFFER_ADDR + MAX_RESCUE_ENTRIES * (BYTES_PER_DATA_REGION_OF_PAGE + BYTES_PER_SPARE_REGION_OF_PAGE) > CHECKPOINT_BUFFER_ADDR)
++		assert(!"[WARNING] Configuration Error: Rescue buffer is too large [WARNING]");
+ 	if(CHECKPOINT_BUFFER_ADDR + CHECKPOINT_PAGES * (BYTES_PER_DATA_REGION_OF_PAGE + BYTES_PER_SPARE_REGION_OF_PAGE) > RECOVERY_READ_BUFFER_ADDR)
+ 		assert(!"[WARNING] Configuration Error: Checkpoint buffer is too large [WARNING]");
+ 	if(RECOVERY_READ_BUFFER_ADDR + USER_DIES * (BYTES_PER_DATA_REGION_OF_PAGE + BYTES_PER_SPARE_REGION_OF_PAGE) > RESERVED_DATA_BUFFER_BASE_ADDR + 0x00200000)
+diff --git a/firmware/garbage_collection.c b/firmware/garbage_collection.c
+index 5e3c74e..05233b3 100644
+--- a/firmware/garbage_collection.c
++++ b/firmware/garbage_collection.c
+@@ -68,8 +68,8 @@ void InitGcVictimMap()
+ }
+ 
+ 
+-/** move the valid slices of a block to the current block of its die and erase it (GC, static wear leveling) */
+-void RelocateBlock(unsigned int dieNo, unsigned int victimBlockNo)
++/** move the valid slices of a block to the current block of its die (GC, static wear leveling, block retirement) */
++void RelocateValidData(unsigned int dieNo, unsigned int victimBlockNo)
+ {
+ 	unsigned int pageNo, virtualSliceAddr, logicalSliceAddr, dieNoForGcCopy, reqSlotTag;
+ 
+@@ -83,7 +83,7 @@ void RelocateBlock(unsigned int dieNo, unsigned int victimBlockNo)
+ 			logicalSliceAddr = virtualSliceMapPtr->virtualSlice[virtualSliceAddr].logicalSliceAddr;
+ 
+ 			if(logicalSliceAddr != LSA_NONE)
+-				if(logicalSliceMapPtr->logicalSlice[logicalSliceAddr].virtualSliceAddr ==  virtualSliceAddr) //valid data
++				if((logicalSliceMapPtr->logicalSlice[logicalSliceAddr].virtualSliceAddr ==  virtualSliceAddr) && !IsRescuePending(virtualSliceAddr)) //valid data
+ 				{
+ 					//read
+ 					reqSlotTag = GetNandReq(REQ_CODE_READ, REQ_OPT_DATA_BUF_TEMP_ENTRY, REQ_OPT_NAND_ADDR_VSA, REQ_OPT_NAND_ECC_ON, REQ_OPT_NAND_ECC_WARNING_OFF, REQ_OPT_ROW_ADDR_DEPENDENCY_CHECK, REQ_OPT_BLOCK_SPACE_MAIN);
+@@ -109,6 +109,13 @@ void RelocateBlock(unsigned int dieNo, unsigned int victimBlockNo)
+ 		}
+ 	}
+ 
++}
++
++/** move the valid slices of a block to the current block of its die and erase it (GC, static wear leveling) */
++void RelocateBlock(unsigned int dieNo, unsigned int victimBlockNo)
++{
++	RelocateValidData(dieNo, victimBlockNo);
++
+ 	//the victim can be the block being written (all of its slices became invalid). It goes back to the free block list
+ 	//when erased, so take another block for writing instead of keeping it as the current block
+ 	if(victimBlockNo == virtualDieMapPtr->die[dieNo].currentBlock)
+diff --git a/firmware/garbage_collection.h b/firmware/garbage_collection.h
+index 2cedfba..52beb41 100644
+--- a/firmware/garbage_collection.h
++++ b/firmware/garbage_collection.h
+@@ -62,6 +62,7 @@ void InitGcVictimMap();
+ #define WEAR_LEVELING_THRESHOLD	100	//docs/design/wear-leveling.md
+ 
+ void GarbageCollection(unsigned int dieNo);
++void RelocateValidData(unsigned int dieNo, unsigned int victimBlockNo);
+ void RelocateBlock(unsigned int dieNo, unsigned int victimBlockNo);
+ void StaticWearLeveling(unsigned int dieNo);
+ 
+diff --git a/firmware/media_error.c b/firmware/media_error.c
+new file mode 100644
+index 0000000..c7407e2
+--- /dev/null
++++ b/firmware/media_error.c
+@@ -0,0 +1,176 @@
++//////////////////////////////////////////////////////////////////////////////////
++// media_error.c: program failure rescue and block retirement — docs/design/media-errors.md
++//
++// When a program fails, the data of the request is copied to a rescue buffer (the data buffer entry is
++// reused as soon as the request ends). The main loop writes it again elsewhere and retires the block:
++// its valid data moves out and it never goes back to the free or GC lists.
++//////////////////////////////////////////////////////////////////////////////////
++
++#include <assert.h>
++#include <string.h>
++#include "xil_printf.h"
++#include "memory_map.h"
++#include "page_meta.h"
++
++#define RESCUE_BUF_BYTES (BYTES_PER_DATA_REGION_OF_PAGE + BYTES_PER_SPARE_REGION_OF_PAGE)
++
++static unsigned int rescueVsa[MAX_RESCUE_ENTRIES];
++static unsigned char rescueUsed[MAX_RESCUE_ENTRIES];
++static unsigned char retirePending[USER_DIES][USER_BLOCKS_PER_DIE];
++static unsigned int pendingCnt;
++static unsigned int processing;
++
++void RescueFailedProgram(unsigned int reqSlotTag)
++{
++	unsigned int vsa, dieNo, blockNo, i, addr;
++
++	if(reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr != REQ_OPT_NAND_ADDR_VSA)
++		return;
++	vsa = reqPoolPtr->reqPool[reqSlotTag].nandInfo.virtualSliceAddr;
++	dieNo = Vsa2VdieTranslation(vsa);
++	blockNo = Vsa2VblockTranslation(vsa);
++	if(IsCheckpointBlock(dieNo, blockNo))
++		return;
++
++	retirePending[dieNo][blockNo] = 1;
++	pendingCnt++;
++
++	//user data: a data buffer entry, a GC temporary entry, or a rescue buffer being written again
++	if(reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat == REQ_OPT_DATA_BUF_ADDR)
++	{
++		addr = reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.addr;
++		if(addr < MEDIA_RESCUE_BUFFER_ADDR || addr >= MEDIA_RESCUE_BUFFER_ADDR + MAX_RESCUE_ENTRIES * RESCUE_BUF_BYTES)
++			return;
++	}
++	else if((reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat != REQ_OPT_DATA_BUF_ENTRY) && (reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat != REQ_OPT_DATA_BUF_TEMP_ENTRY))
++		return;
++
++	for(i = 0; i < MAX_RESCUE_ENTRIES; i++)
++		if(!rescueUsed[i])
++			break;
++	if(i == MAX_RESCUE_ENTRIES)
++		assert(!"[WARNING] No rescue buffer for a failed program [WARNING]");
++
++	addr = MEDIA_RESCUE_BUFFER_ADDR + i * RESCUE_BUF_BYTES;
++	memmove((void*)addr, (void*)GenerateDataBufAddr(reqSlotTag), BYTES_PER_DATA_REGION_OF_PAGE);
++	memmove((void*)(addr + BYTES_PER_DATA_REGION_OF_PAGE), (void*)GenerateSpareDataBufAddr(reqSlotTag), BYTES_PER_SPARE_REGION_OF_PAGE);
++	rescueVsa[i] = vsa;
++	rescueUsed[i] = 1;
++}
++
++/** a failed program not written again yet: its page holds nothing, GC must not copy it */
++int IsRescuePending(unsigned int virtualSliceAddr)
++{
++	unsigned int i;
++
++	for(i = 0; i < MAX_RESCUE_ENTRIES; i++)
++		if(rescueUsed[i] && rescueVsa[i] == virtualSliceAddr)
++			return 1;
++	return 0;
++}
++
++static void RewriteRescued(unsigned int i)
++{
++	unsigned int addr, lsa, seq, newVsa, reqSlotTag;
++
++	addr = MEDIA_RESCUE_BUFFER_ADDR + i * RESCUE_BUF_BYTES;
++	rescueUsed[i] = 0;
++	if(!ParsePageMeta(addr + BYTES_PER_DATA_REGION_OF_PAGE, &lsa, &seq) || lsa >= SLICES_PER_SSD)
++		return;
++	//the host wrote the slice again meanwhile: the rescued data is old
++	if(logicalSliceMapPtr->logicalSlice[lsa].virtualSliceAddr != rescueVsa[i])
++		return;
++
++	newVsa = AddrTransWrite(lsa);
++	FillPageMeta(addr + BYTES_PER_DATA_REGION_OF_PAGE, lsa);
++
++	reqSlotTag = GetNandReq(REQ_CODE_WRITE, REQ_OPT_DATA_BUF_ADDR, REQ_OPT_NAND_ADDR_VSA, REQ_OPT_NAND_ECC_ON, REQ_OPT_NAND_ECC_WARNING_ON, REQ_OPT_ROW_ADDR_DEPENDENCY_CHECK, REQ_OPT_BLOCK_SPACE_MAIN);
++	reqPoolPtr->reqPool[reqSlotTag].logicalSliceAddr = lsa;
++	reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.addr = addr;
++	reqPoolPtr->reqPool[reqSlotTag].nandInfo.virtualSliceAddr = newVsa;
++	SelectLowLevelReqQ(reqSlotTag);
++	SyncAllLowLevelReqDone();
++}
++
++static void RetireBlock(unsigned int dieNo, unsigned int blockNo)
++{
++	P_VIRTUAL_BLOCK_ENTRY block = &virtualBlockMapPtr->block[dieNo][blockNo];
++
++	xil_printf("[ retire die %d block %d ]\r\n", dieNo, blockNo);
++	if(block->free)
++	{
++		//a free block that failed: take it out of the free block list
++		unsigned int prev = block->prevBlock, next = block->nextBlock;
++		if(prev != BLOCK_NONE)
++			virtualBlockMapPtr->block[dieNo][prev].nextBlock = next;
++		else
++			virtualDieMapPtr->die[dieNo].headFreeBlock = next;
++		if(next != BLOCK_NONE)
++			virtualBlockMapPtr->block[dieNo][next].prevBlock = prev;
++		else
++			virtualDieMapPtr->die[dieNo].tailFreeBlock = prev;
++		virtualDieMapPtr->die[dieNo].freeBlockCnt--;
++		block->free = 0;
++	}
++	else
++	{
++		if(block->invalidSliceCnt)
++			SelectiveGetFromGcVictimList(dieNo, blockNo);
++		//moves the valid slices out (takes another current block if this one is current)
++		RelocateValidData(dieNo, blockNo);
++		SyncAllLowLevelReqDone();
++		if(virtualDieMapPtr->die[dieNo].currentBlock == blockNo)
++		{
++			virtualDieMapPtr->die[dieNo].currentBlock = GetFromFbList(dieNo, GET_FREE_BLOCK_GC);
++			if(virtualDieMapPtr->die[dieNo].currentBlock == BLOCK_FAIL)
++				assert(!"[WARNING] There is no available block [WARNING]");
++		}
++	}
++	block->bad = 1;
++	block->currentPage = USER_PAGES_PER_BLOCK;
++	block->prevBlock = BLOCK_NONE;
++	block->nextBlock = BLOCK_NONE;
++}
++
++void ProcessMediaFailures()
++{
++	unsigned int i, dieNo, blockNo, again;
++
++	if(!pendingCnt || processing)
++		return;
++	processing = 1;
++
++	do
++	{
++		again = 0;
++		//stop writing to the failed blocks first, so the rescued data goes elsewhere
++		for(dieNo = 0; dieNo < USER_DIES; dieNo++)
++		{
++			blockNo = virtualDieMapPtr->die[dieNo].currentBlock;
++			if(retirePending[dieNo][blockNo])
++				virtualBlockMapPtr->block[dieNo][blockNo].currentPage = USER_PAGES_PER_BLOCK;
++		}
++		for(i = 0; i < MAX_RESCUE_ENTRIES; i++)
++			if(rescueUsed[i])
++				RewriteRescued(i);
++		for(dieNo = 0; dieNo < USER_DIES; dieNo++)
++			for(blockNo = 0; blockNo < USER_BLOCKS_PER_DIE; blockNo++)
++				if(retirePending[dieNo][blockNo])
++				{
++					retirePending[dieNo][blockNo] = 0;
++					if(!virtualBlockMapPtr->block[dieNo][blockNo].bad)
++						RetireBlock(dieNo, blockNo);
++					again = 1;
++				}
++		pendingCnt = 0;
++		for(i = 0; i < MAX_RESCUE_ENTRIES; i++)
++			if(rescueUsed[i])
++				pendingCnt++;
++		for(dieNo = 0; dieNo < USER_DIES; dieNo++)
++			for(blockNo = 0; blockNo < USER_BLOCKS_PER_DIE; blockNo++)
++				if(retirePending[dieNo][blockNo])
++					pendingCnt++;
++	} while(again && pendingCnt);
++
++	processing = 0;
++}
+diff --git a/firmware/media_error.h b/firmware/media_error.h
+new file mode 100644
+index 0000000..46265eb
+--- /dev/null
++++ b/firmware/media_error.h
+@@ -0,0 +1,14 @@
++//////////////////////////////////////////////////////////////////////////////////
++// media_error.h: program failure rescue and block retirement — docs/design/media-errors.md
++//////////////////////////////////////////////////////////////////////////////////
++
++#ifndef MEDIA_ERROR_H_
++#define MEDIA_ERROR_H_
++
++#define MAX_RESCUE_ENTRIES		32
++
++void RescueFailedProgram(unsigned int reqSlotTag);
++void ProcessMediaFailures();
++int IsRescuePending(unsigned int virtualSliceAddr);
++
++#endif /* MEDIA_ERROR_H_ */
+diff --git a/firmware/memory_map.h b/firmware/memory_map.h
+index 424dbba..5bf2f24 100644
+--- a/firmware/memory_map.h
++++ b/firmware/memory_map.h
+@@ -54,6 +54,7 @@
+ #include "request_transform.h"
+ #include "garbage_collection.h"
+ #include "checkpoint.h"
++#include "media_error.h"
+ 
+ #define DRAM_START_ADDR					0x00100000
+ 
+@@ -80,6 +81,8 @@
+ //for checkpoint pages and recovery reads, inside the reserved data buffer area (docs/design/power-loss.md)
+ #define CHECKPOINT_BUFFER_ADDR					(RESERVED_DATA_BUFFER_BASE_ADDR + 0x00100000)
+ #define RECOVERY_READ_BUFFER_ADDR				(RESERVED_DATA_BUFFER_BASE_ADDR + 0x00180000)
++//for data of failed programs until they are written again (docs/design/media-errors.md)
++#define MEDIA_RESCUE_BUFFER_ADDR				(RESERVED_DATA_BUFFER_BASE_ADDR + 0x00040000)
+ //for nand request completion
+ #define COMPLETE_FLAG_TABLE_ADDR			0x17000000
+ #define STATUS_REPORT_TABLE_ADDR			(COMPLETE_FLAG_TABLE_ADDR + sizeof(COMPLETE_FLAG_TABLE))
+diff --git a/firmware/nvme/nvme_main.c b/firmware/nvme/nvme_main.c
+index 09896ca..b8365c2 100644
+--- a/firmware/nvme/nvme_main.c
++++ b/firmware/nvme/nvme_main.c
+@@ -131,6 +131,9 @@ void nvme_main()
+ 				FlushDataBuf();
+ 				//keep the erase counts (docs/design/wear-leveling.md)
+ 				WriteCheckpoint();
++				//the bad block table must be written before shutdown is reported: the host may cut the power right after
++				//(an erased table block without the new table makes every written block look bad at the next boot)
++				UpdateBadBlockTableForGrownBadBlock(RESERVED_DATA_BUFFER_BASE_ADDR);
+ 
+ 				for(qID = 0; qID < 8; qID++)
+ 				{
+@@ -143,8 +146,6 @@ void nvme_main()
+ 				set_nvme_csts_shst(2);
+ 				g_nvmeTask.status = NVME_TASK_WAIT_RESET;
+ 
+-				//flush grown bad block info
+-				UpdateBadBlockTableForGrownBadBlock(RESERVED_DATA_BUFFER_BASE_ADDR);
+ 
+ 				xil_printf("\r\nNVMe shutdown!!!\r\n");
+ 			}
+@@ -184,6 +185,8 @@ void nvme_main()
+ 			CheckDoneNvmeDmaReq();
+ 			SchedulingNandReq();
+ 		}
++
++		ProcessMediaFailures();
+ 	}
+ }
+ 
+diff --git a/firmware/request_schedule.c b/firmware/request_schedule.c
+index e6eeb77..7d94248 100644
+--- a/firmware/request_schedule.c
++++ b/firmware/request_schedule.c
+@@ -975,6 +975,10 @@ void ExecuteNandReq(unsigned int chNo, unsigned int wayNo, unsigned int reqStatu
+ 				}
+ 				else
+ 				{
++					//keep the data and retire the block (docs/design/media-errors.md)
++					if(reqPoolPtr->reqPool[reqSlotTag].reqCode == REQ_CODE_WRITE)
++						RescueFailedProgram(reqSlotTag);
++
+ 					//grown bad block information update
+ 					phyBlockNo = ((rowAddr % LUN_1_BASE_ADDR) / PAGES_PER_MLC_BLOCK) + ((rowAddr / LUN_1_BASE_ADDR)* TOTAL_BLOCKS_PER_LUN);
+ 					UpdatePhyBlockMapForGrownBadBlock(Pcw2VdieTranslation(chNo, wayNo), phyBlockNo);
+diff --git a/firmware/request_transform.c b/firmware/request_transform.c
+index d8db29b..12f6d4f 100644
+--- a/firmware/request_transform.c
++++ b/firmware/request_transform.c
+@@ -204,6 +204,8 @@ void FlushDataBuf()
+ 		WriteBackDataBufEntry(dataBufEntry, 0);
+ 
+ 	SyncAllLowLevelReqDone();
++	//a failed program is written again elsewhere before the flush completes (docs/design/media-errors.md)
++	ProcessMediaFailures();
+ }
+ 
+ void DataReadFromNand(unsigned int originReqSlotTag)

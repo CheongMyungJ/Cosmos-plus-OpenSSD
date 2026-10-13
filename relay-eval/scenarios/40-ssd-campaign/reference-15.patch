@@ -1,0 +1,86 @@
+diff --git a/firmware/request_schedule.c b/firmware/request_schedule.c
+index ce5478a..e6eeb77 100644
+--- a/firmware/request_schedule.c
++++ b/firmware/request_schedule.c
+@@ -49,6 +49,7 @@
+ #include <assert.h>
+ #include "xil_printf.h"
+ #include "memory_map.h"
++#include "nvme/host_lld.h"
+ #include "nvme/debug.h"
+ 
+ P_COMPLETE_FLAG_TABLE completeFlagTablePtr;
+@@ -884,6 +885,28 @@ unsigned int CheckEccErrorInfo(unsigned int chNo, unsigned int wayNo)
+ 	return ERROR_INFO_FAIL;
+ }
+ 
++/**
++ * a host read of a slice failed after the retries (docs/design/media-errors.md): complete its command with
++ * Unrecovered Read Error and drop the data buffer entry so that the next read goes to NAND again
++ */
++void ReportUnrecoveredRead(unsigned int reqSlotTag)
++{
++	NVME_COMPLETION nvmeCPL;
++	unsigned int bufEntry = reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.entry;
++
++	nvmeCPL.dword[0] = 0;
++	nvmeCPL.specific = 0x0;
++	nvmeCPL.statusField.SCT = SCT_MEDIA_AND_DATA_INTEGRITY_ERRORS;
++	nvmeCPL.statusField.SC = SC_UNRECOVERED_READ_ERROR;
++	set_auto_nvme_cpl(reqPoolPtr->reqPool[reqSlotTag].nvmeCmdSlotTag, nvmeCPL.specific, nvmeCPL.statusFieldWord);
++
++	if((dataBufMapPtr->dataBuf[bufEntry].dirty == DATA_BUF_CLEAN) && (dataBufMapPtr->dataBuf[bufEntry].logicalSliceAddr == reqPoolPtr->reqPool[reqSlotTag].logicalSliceAddr))
++	{
++		SelectiveGetFromDataBufHashList(bufEntry);
++		dataBufMapPtr->dataBuf[bufEntry].logicalSliceAddr = LSA_NONE;
++	}
++}
++
+ void ExecuteNandReq(unsigned int chNo, unsigned int wayNo, unsigned int reqStatus)
+ {
+ 	unsigned int reqSlotTag, rowAddr, phyBlockNo;
+@@ -944,9 +967,18 @@ void ExecuteNandReq(unsigned int chNo, unsigned int wayNo, unsigned int reqStatu
+ 						*badCheck = PSEUDO_BAD_BLOCK_MARK;
+ 					}
+ 
+-				//grown bad block information update
+-				phyBlockNo = ((rowAddr % LUN_1_BASE_ADDR) / PAGES_PER_MLC_BLOCK) + ((rowAddr / LUN_1_BASE_ADDR)* TOTAL_BLOCKS_PER_LUN);
+-				UpdatePhyBlockMapForGrownBadBlock(Pcw2VdieTranslation(chNo, wayNo), phyBlockNo);
++				if((reqPoolPtr->reqPool[reqSlotTag].reqCode == REQ_CODE_READ) || (reqPoolPtr->reqPool[reqSlotTag].reqCode == REQ_CODE_READ_TRANSFER))
++				{
++					//a read failure does not make the block bad (docs/design/media-errors.md)
++					if(reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat == REQ_OPT_DATA_BUF_ENTRY)
++						ReportUnrecoveredRead(reqSlotTag);
++				}
++				else
++				{
++					//grown bad block information update
++					phyBlockNo = ((rowAddr % LUN_1_BASE_ADDR) / PAGES_PER_MLC_BLOCK) + ((rowAddr / LUN_1_BASE_ADDR)* TOTAL_BLOCKS_PER_LUN);
++					UpdatePhyBlockMapForGrownBadBlock(Pcw2VdieTranslation(chNo, wayNo), phyBlockNo);
++				}
+ 
+ 				retryLimitTablePtr->retryLimit[chNo][wayNo] = RETRY_LIMIT;
+ 				GetFromNandReqQ(chNo, wayNo, reqStatus, reqPoolPtr->reqPool[reqSlotTag].reqCode);
+@@ -957,9 +989,7 @@ void ExecuteNandReq(unsigned int chNo, unsigned int wayNo, unsigned int reqStatu
+ 				rowAddr = GenerateNandRowAddr(reqSlotTag);
+ 				xil_printf("ECC Uncorrectable Soon on ch %x way %x rowAddr %x / completion %x statusReport %x \r\n", chNo, wayNo, rowAddr, completeFlagTablePtr->completeFlag[chNo][wayNo],statusReportTablePtr->statusReport[chNo][wayNo]);
+ 
+-				//grown bad block information update
+-				phyBlockNo = ((rowAddr % LUN_1_BASE_ADDR) / PAGES_PER_MLC_BLOCK) + ((rowAddr / LUN_1_BASE_ADDR)* TOTAL_BLOCKS_PER_LUN);
+-				UpdatePhyBlockMapForGrownBadBlock(Pcw2VdieTranslation(chNo, wayNo), phyBlockNo);
++				//a correctable read with many bit errors succeeds and does not make the block bad (docs/design/media-errors.md)
+ 
+ 				retryLimitTablePtr->retryLimit[chNo][wayNo] = RETRY_LIMIT;
+ 				GetFromNandReqQ(chNo, wayNo, reqStatus, reqPoolPtr->reqPool[reqSlotTag].reqCode);
+diff --git a/firmware/request_schedule.h b/firmware/request_schedule.h
+index c7329bb..1fd262d 100644
+--- a/firmware/request_schedule.h
++++ b/firmware/request_schedule.h
+@@ -161,6 +161,7 @@ unsigned int CheckReqStatus(unsigned int chNo, unsigned int wayNo);
+ unsigned int CheckEccErrorInfo(unsigned int chNo, unsigned int wayNo);
+ 
+ void ExecuteNandReq(unsigned int chNo, unsigned int wayNo, unsigned int reqStatus);
++void ReportUnrecoveredRead(unsigned int reqSlotTag);
+ 
+ 
+ extern P_COMPLETE_FLAG_TABLE completeFlagTablePtr;

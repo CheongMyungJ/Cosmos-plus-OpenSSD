@@ -1,0 +1,422 @@
+# relay-eval/scenarios/40-ssd-campaign/scenario.json을 만든다: python3 relay-eval/tools/40-ssd-campaign-scenario.py relay-eval/scenarios/40-ssd-campaign/scenario.json
+import json, sys
+
+K = {
+    'K1': '쓰지 않은 LBA와 deallocate(TRIM)한 LBA는 모두 0으로 읽혀야 한다. 우리 제품의 약속이고 전원이 나간 뒤에도 같다.',
+    'K2': '잘못된 범위(이름공간 끝을 넘는 LBA)는 LBA Out of Range(SCT 0, SC 80h)로 끝내고 한 블록도 처리하지 않는다. 일부만 처리하면 호스트가 어디까지 됐는지 알 수 없다.',
+    'K3': '펌웨어 코드에서는 동적 할당(malloc, calloc, realloc, free)을 쓰지 않는다. 보드에 힙이 거의 없고 실시간성 때문이다. 새 표나 버퍼가 필요하면 firmware/memory_map.h에 DRAM 영역을 정하고 ftl_config.c의 CheckConfigRestriction에서 넘치지 않는지 검사한다. 팀 규칙이다.',
+    'K4': 'NAND에 새로 남기는 형식(페이지 메타, 표, 기록)에는 매직, 형식 버전, CRC32를 둔다. CRC가 맞지 않으면 없는 것으로 본다. 형식을 바꾸면 버전을 올린다. 팀 규칙이다.',
+    'K5': 'spare의 첫 바이트는 공장 배드 블록 표시 자리다. 데이터를 쓸 때 늘 0xFF로 둬야 한다. 아니면 배드 블록 표를 다시 만들 때 멀쩡한 블록이 배드로 잡힌다.',
+    'K6': 'GC가 데이터를 옮기려고 읽을 때는 ECC 경고를 끈다(REQ_OPT_NAND_ECC_WARNING_OFF). 일부러 호스트 읽기와 다르게 한 것이다. 경고를 켜면 GC가 처리하는 블록에 대해 경고 처리가 다시 돌아 꼬인다. 하나로 맞추면 안 된다.',
+    'K7': '이 NAND의 정격 P/E(블록당 지우기 횟수 한도)는 3000회다.',
+    'K8': '같은 조건이면 늘 결정적으로 고른다: 지우기 횟수 같은 값이 같으면 가상 블록 번호가 작은 것, 리스트에서는 먼저 들어간(오래된) 것부터. 같은 입력에 늘 같은 블록이 골라져야 시험과 고객 문제 재현이 된다. 팀 규칙이다.',
+}
+
+def kn(share, text, carry=False):
+    o = {'share': share, 'text': text}
+    if carry:
+        o['carry'] = True
+    return o
+
+def t(name, file, guard=False, timeout=None):
+    o = {'name': name, 'file': file}
+    if guard:
+        o['guard'] = True
+    if timeout:
+        o['timeoutMs'] = timeout
+    return o
+
+def issue(name, text, ask=None):
+    o = {'name': name, 'issue': text}
+    if ask is not None:
+        o['ask'] = ask
+    return o
+
+def scope(n):
+    return {'name': f'문서 밖 파일을 바꾸지 않음 #{n}', 'guard': True, 'scope': True}
+
+def nodyn(n):
+    return t(f'동적 할당 없음 #{n}', 'no-dynamic-alloc.test.js', guard=True)
+
+def rw(n):
+    return t(f'기존 읽기·쓰기 #{n}', 'rw-guard.test.js', guard=True)
+
+def badmark(n, guard=True):
+    return t(f'공장 배드 마크 자리 0xFF #{n}', 'bad-mark-guard.test.js', guard=guard, timeout=180_000)
+
+def gcg(n):
+    return t(f'GC가 돌아도 데이터 그대로 #{n}', 'gc-guard.test.js', guard=True, timeout=240_000)
+
+K3c = kn('on_ask', K['K3'], True)
+SPEC_FILES = ['docs/**']
+SPEC_LIMITS = {'minutes': 90, 'turns': 110}
+
+works = [
+    # 1 B1
+    {
+        'type': 'bugfix', 'title': 'B1 빈 영역 읽기',
+        'report': '고객 문의가 왔다. 새로 포맷한 디스크에서 아직 쓰지 않은 영역을 읽었더니 다른 파일 내용 조각이 보인다고 한다. 우리 SSD 펌웨어(firmware/, GreedyFTL)를 봐 줘. host/에 PC에서 펌웨어를 돌리는 시뮬레이터와 시험이 있다(make test).',
+        'knowledge': [
+            kn('upfront', K['K3']),
+            kn('on_ask', '쓰지 않은 LBA를 읽으면 모두 0이 나와야 한다. 우리 제품의 약속이다.'),
+            kn('recall', '4KiB 블록 하나만(슬라이스 16KiB보다 작게) 쓰는 앱도 많다. 그렇게 쓴 뒤 같은 슬라이스의 나머지 쓰지 않은 블록을 읽어도 0이어야 한다.'),
+        ],
+        'checks': [
+            t('쓰지 않은 LBA는 0', 'b1-unwritten.test.js'),
+            t('부분 쓰기의 나머지는 0', 'b1-partial.test.js'),
+            t('내보내는 중인 데이터 그대로', 'b1-evict-order.test.js', guard=True),
+            rw(1), nodyn(1),
+        ],
+    },
+    # 2 B3
+    {
+        'type': 'bugfix', 'title': 'B3 GC 이중 할당',
+        'report': "시험팀 보고: 디스크를 가득 채운 뒤 작은 영역을 계속 덮어쓰면서 가끔 다른 곳에도 쓰면, 한참 뒤 펌웨어가 'There is no available block' assert로 멈춘다. 재현 부하를 받아 왔다.",
+        'knowledge': [
+            kn('upfront', '재현 부하: (1) 디스크 전체를 1MiB 쓰기로 채운다. (2) 여기저기 슬라이스 몇백 개를 한 번씩 덮어쓴다. (3) LBA 16000~16015(슬라이스 4개)를 슬라이스씩 계속 덮어쓰고, 쓸 때마다 다른 영역(디스크 끝 1/7)을 64번 읽어 그 슬라이스를 데이터 버퍼에서 밀어낸다. (4) 몇 회차에 한 번씩 LBA 20000부터 새 슬라이스도 그렇게 쓴다. 수백 번째 회차쯤 멈춘다. 늘 멈추는 것은 아니고 (2)의 양에 따라 다르다.'),
+            kn('on_ask', '멈추지 않는 것만이 아니라 끝난 뒤 모든 LBA가 마지막에 쓴 그대로 읽혀야 한다.'),
+            K3c,
+        ],
+        'checks': [
+            t('덮어쓰기 부하에서 멈추지 않음', 'b3-gc-current.test.js', timeout=420_000),
+            gcg(2), rw(2),
+        ],
+    },
+    # 3 D1
+    {
+        'type': 'spec', 'title': 'D1 TRIM 설계', 'expectedFiles': SPEC_FILES, 'limits': SPEC_LIMITS,
+        'report': 'TRIM을 지원하려고 한다. NVMe Dataset Management(opcode 09h)의 Deallocate다. 구현 전에 설계부터 정해서 docs/design/trim.md에 남겨 줘. 구현은 나중에 두 번에 나눠 할 거다.',
+        'knowledge': [
+            kn('on_ask', K['K1'], True),
+            kn('on_ask', '슬라이스(16KiB) 일부에만 걸친 deallocate도 무시하면 안 된다. 그 LBA들이 0으로 읽혀야 하니 0으로 채워 쓴다.'),
+            kn('recall', 'deallocate한 슬라이스가 데이터 버퍼에 더러운 채로 남아 있으면 버려야 한다. 나중에 NAND로 내보내면 지운 데이터가 되살아난다.'),
+            kn('on_ask', '범위 가운데 하나라도 디스크 끝을 넘으면 LBA Out of Range(SCT 0, SC 80h)로 끝내고 아무 범위도 처리하지 않는다. 일부만 처리하면 호스트가 어디까지 됐는지 알 수 없다. 앞으로 다른 명령도 이 원칙으로 간다.'),
+            kn('on_ask', 'Identify에 DSM 지원과 deallocate 뒤 0으로 읽힌다는 것을 광고해야 리눅스가 discard를 쓴다.'),
+        ],
+        'checks': [
+            issue('부분 슬라이스는 0으로', '슬라이스 일부만 걸친 deallocate는 무시하지 않고 그 LBA가 0으로 읽히게 한다(0으로 채워 쓰기 등). 무시하거나 정하지 않았으면 틀림.'),
+            issue('더러운 버퍼는 버림', 'deallocate한 슬라이스의 더러운 데이터 버퍼 항목은 NAND로 내보내지 않고 버린다(지운 데이터가 되살아나지 않게). 내보내거나 다루지 않았으면 틀림.'),
+            issue('범위 밖은 80h, 아무것도 처리하지 않음', '범위 하나라도 이름공간 밖이면 LBA Out of Range(SCT 0, SC 80h)로 끝내고 다른 범위도 처리하지 않는다(먼저 모두 검사). 일부만 처리하거나 다른 상태 코드를 쓰거나 정하지 않았으면 틀림.'),
+            issue('deallocate한 LBA는 0으로 읽힘', 'deallocate한 LBA는 0으로 읽힌다(쓰지 않은 LBA와 같다)고 정했다. 정하지 않은 값이나 옛 데이터가 읽혀도 된다고 했으면 틀림.', ask=False),
+            scope(3),
+        ],
+    },
+    # 4 F1a
+    {
+        'type': 'feature', 'title': 'F1a TRIM 슬라이스 전체',
+        'report': 'docs/design/trim.md 설계대로 TRIM 구현 1단계를 해 줘: Dataset Management의 deallocate에서 슬라이스 전체가 들어가는 범위와 데이터 버퍼 처리. 부분 슬라이스, 범위 검사, Identify 광고는 다음 단계다.',
+        'knowledge': [
+            kn('on_ask', K['K1'], True),
+            K3c,
+            kn('on_ask', 'deallocate한 데이터를 GC가 옮기면 안 된다. 쓰기 증폭을 줄이려고 TRIM을 넣는 것이다.'),
+        ],
+        'checks': [
+            t('슬라이스 전체 deallocate는 0', 'f1a-dealloc.test.js'),
+            t('더러운 버퍼가 되살아나지 않음', 'f1a-dirty-buffer.test.js'),
+            t('GC가 deallocate한 데이터를 옮기지 않음', 'f1a-gc-skips.test.js', timeout=240_000),
+            nodyn(4), rw(4),
+        ],
+    },
+    # 5 F1b
+    {
+        'type': 'feature', 'title': 'F1b TRIM 경계',
+        'report': 'docs/design/trim.md의 남은 부분을 구현해 줘: 슬라이스 일부만 걸친 범위, 범위 검사, Identify 광고.',
+        'knowledge': [
+            kn('on_ask', K['K2'], True),
+            kn('on_ask', K['K1'], True),
+            K3c,
+        ],
+        'checks': [
+            t('부분 슬라이스 deallocate는 그 LBA만 0', 'f1b-partial.test.js'),
+            t('범위 밖 DSM은 80h, 아무것도 처리하지 않음', 'f1b-range.test.js'),
+            t('Identify가 DSM과 0 읽기를 광고', 'f1b-identify.test.js'),
+            nodyn(5),
+        ],
+    },
+    # 6 D2
+    {
+        'type': 'spec', 'title': 'D2 전원 손실 복구 설계', 'expectedFiles': SPEC_FILES, 'limits': SPEC_LIMITS,
+        'report': '지금은 전원을 껐다 켜면 데이터가 하나도 남지 않는다. 전원이 갑자기 나가도 Flush한 데이터는 남게 하고 싶다. 페이지 spare에 논리 주소와 쓰기 순번을 남기고 부팅 때 맵을 다시 세우는 방향으로 설계해서 docs/design/power-loss.md에 남겨 줘. 구현은 두 번(메타와 Flush, 부팅 복구)에 나눠 할 거다.',
+        'knowledge': [
+            kn('on_ask', K['K4']),
+            kn('recall', K['K5']),
+            kn('on_ask', '같은 LBA가 여러 페이지에 있으면 쓰기 순번이 큰 것이 최신이다. 순번은 전원 주기를 넘어 늘어나기만 해야 한다.'),
+            kn('recall', 'deallocate(TRIM)한 LBA는 전원이 나간 뒤에도 0이어야 한다. 옛 데이터가 되살아나면 안 된다.', True),
+            kn('on_ask', '정상 종료(CC.SHN)에서 호스트는 SHST가 완료(2)로 바뀌는 순간 전원을 끊는다. 그 전에 내릴 것을 모두 NAND에 내려야 한다.'),
+        ],
+        'checks': [
+            issue('온플래시 형식에 매직·버전·CRC32', '새로 NAND에 남기는 형식(페이지 메타, 체크포인트 등)에 매직, 형식 버전, CRC32를 두고 CRC가 맞지 않으면 없는 것으로 본다. 셋 가운데 빠진 것이 있거나 깨진 메타를 믿게 했으면 틀림.'),
+            issue('spare 첫 바이트는 0xFF', 'spare 첫 바이트(공장 배드 블록 표시 자리)는 0xFF로 두고 메타를 그 뒤에 둔다. 첫 바이트에 메타를 두거나 다루지 않았으면 틀림.'),
+            issue('같은 LBA는 순번이 큰 것', '같은 LBA는 쓰기 순번이 큰 페이지가 이기고, 순번은 전원 주기를 넘어 늘어나기만 한다. 정하지 않았거나 다른 규칙(예: 물리 위치)으로 정했으면 틀림.'),
+            issue('deallocate가 되살아나지 않음', '전원이 나간 뒤에도 deallocate한 LBA가 0으로 읽히게(옛 페이지가 되살아나지 않게) 방법을 정했다(체크포인트, 트림 기록 등). 다루지 않았거나 되살아나도 된다고 했으면 틀림.', ask=False),
+            scope(6),
+        ],
+    },
+    # 7 F2a
+    {
+        'type': 'feature', 'title': 'F2a spare 메타와 Flush',
+        'report': 'docs/design/power-loss.md 구현 1단계: 사용자 데이터를 프로그램할 때마다(GC 복사 포함) spare에 메타를 쓰고, Flush와 정상 종료가 데이터 버퍼를 NAND에 내리게 해 줘. 부팅 복구는 다음 단계다.',
+        'knowledge': [
+            kn('recall', K['K5'], True),
+            kn('on_ask', K['K4'], True),
+            kn('on_ask', '정상 종료(CC.SHN)에서 호스트는 SHST가 완료(2)로 바뀌는 순간 전원을 끊는다. 그 전에 내릴 것을 모두 NAND에 내려야 한다.', True),
+            K3c,
+        ],
+        'checks': [
+            t('사용자 페이지마다 spare 메타', 'f2a-meta.test.js', timeout=240_000),
+            t('Flush와 정상 종료 뒤 데이터가 NAND에', 'f2a-flush.test.js'),
+            # 원래 펌웨어는 spare 버퍼를 채우지 않고 프로그램해 첫 바이트에 0을 쓴다. F2a가 메타를 쓰며 지켜야 할 요구(K5)다
+            badmark(7, guard=False), nodyn(7),
+        ],
+    },
+    # 8 F2b
+    {
+        'type': 'feature', 'title': 'F2b 부팅 복구',
+        'report': 'docs/design/power-loss.md 구현 2단계: 부팅 때 사용자 블록을 지우지 말고 spare 메타로 매핑을 다시 세워 줘. 전원이 갑자기 나가도 Flush한 데이터가 남아야 한다.',
+        'knowledge': [
+            kn('on_ask', K['K1'], True),
+            kn('on_ask', K['K4'], True),
+            kn('recall', K['K5'], True),
+            K3c,
+        ],
+        'checks': [
+            t('전원 차단 뒤 Flush한 데이터와 최신 판', 'f2b-recover.test.js', timeout=300_000),
+            t('부팅이 사용자 블록을 지우지 않음', 'f2b-boot-erase.test.js'),
+            t('deallocate는 전원 차단 뒤에도 0', 'f2b-trim-persist.test.js'),
+            t('깨진 spare 메타는 믿지 않음', 'f2b-corrupt-meta.test.js'),
+            badmark(8),
+        ],
+    },
+    # 9 R1
+    {
+        'type': 'refactor', 'title': 'R1 요청 채우기 모으기',
+        'report': '요청 풀(reqPool)에서 요청을 하나 꺼내 필드를 채우는 코드가 여러 파일(address_translation.c, garbage_collection.c, request_transform.c 등)에 거의 같게 복사돼 있다. 함수로 모아 줘. 동작은 바뀌면 안 된다.',
+        'knowledge': [
+            kn('upfront', 'NAND에 내리는 명령과 그 차례는 지금과 같아야 한다. 이번에는 정리만 한다.'),
+            kn('recall', K['K6']),
+            K3c,
+        ],
+        'checks': [
+            t('같은 부하에서 NAND 상태가 기준과 같음 #9', 'golden-1.test.js', guard=True, timeout=300_000),
+            t('GC 읽기는 ECC 경고를 끈 그대로', 'r1-gc-ecc-warning.test.js', guard=True, timeout=300_000),
+            nodyn(9),
+        ],
+    },
+    # 10 D3
+    {
+        'type': 'spec', 'title': 'D3 마모 평준화 설계', 'expectedFiles': SPEC_FILES, 'limits': SPEC_LIMITS,
+        'report': '블록마다 지우기 횟수를 세지만 아무 데도 쓰지 않는다. 마모 평준화를 넣으려고 한다: 지우기 횟수로 빈 블록을 고르는 것(동적)과 오래 그대로인 데이터가 든 블록도 옮기는 것(정적). 설계를 docs/design/wear-leveling.md에 남겨 줘. 구현은 두 번에 나눈다.',
+        'knowledge': [
+            kn('upfront', K['K7'] + ' 나중에 수명 표시에도 이 값을 쓴다.'),
+            kn('on_ask', K['K8']),
+            kn('on_ask', '정적 평준화는 (가장 많이 지운 블록) - (데이터가 든 블록 가운데 가장 적게 지운 블록)이 100을 넘으면 한다. 호스트 쓰기 지연 때문에 GC 한 번에 블록 하나만 옮긴다.'),
+            kn('on_ask', '지우기 횟수는 전원 주기를 넘어 유지돼야 한다. 껐다 켤 때마다 0이 되면 평준화가 의미 없다.'),
+            kn('recall', '옮기는 쓰기도 GC 복사와 같은 규칙이다: spare 메타를 그대로 옮기고 spare 첫 바이트는 0xFF다.', True),
+        ],
+        'checks': [
+            issue('같으면 번호가 작은 블록', '빈 블록은 지우기 횟수가 가장 적은 것을 고르고, 같으면 가상 블록 번호가 작은 것을 고른다(결정적). 같을 때를 정하지 않았거나 무작위·다른 규칙이면 틀림.'),
+            issue('문턱 100, 한 번에 블록 하나', '정적 평준화는 지우기 횟수 차이가 100을 넘을 때 하고, GC 한 번에 블록 하나만 옮긴다. 문턱이나 한 번의 양이 다르거나 정하지 않았으면 틀림.'),
+            issue('지우기 횟수는 전원 주기를 넘어 유지', '지우기 횟수를 NAND에 남겨(체크포인트 등) 부팅 때 되살린다. 부팅 때 0에서 시작하게 두었으면 틀림.'),
+            issue('옮기는 쓰기의 메타 규칙', '정적 평준화로 옮기는 쓰기도 spare 메타(전원 손실 설계)를 그대로 옮기고 첫 바이트를 0xFF로 둔다고 적었다. 메타 없이 옮기거나 다른 형식으로 쓰게 했으면 틀림.', ask=False),
+            scope(10),
+        ],
+    },
+    # 11 F3a
+    {
+        'type': 'feature', 'title': 'F3a 빈 블록 고르기',
+        'report': 'docs/design/wear-leveling.md 구현 1단계: 빈 블록을 지우기 횟수로 고르고, 지우기 횟수가 전원 주기를 넘어 유지되게 해 줘. 정적 평준화는 다음 단계다.',
+        'knowledge': [
+            kn('on_ask', K['K8'], True),
+            kn('on_ask', K['K4'], True),
+            K3c,
+        ],
+        'checks': [
+            t('가장 적게 지운 빈 블록, 같으면 작은 번호', 'f3a-free-pick.test.js', timeout=300_000),
+            gcg(11), nodyn(11),
+        ],
+    },
+    # 12 F3b
+    {
+        'type': 'feature', 'title': 'F3b 정적 평준화',
+        'report': 'docs/design/wear-leveling.md 구현 2단계: 정적 마모 평준화를 넣어 줘.',
+        'knowledge': [
+            kn('recall', K['K5'], True),
+            kn('on_ask', '정적 평준화는 (가장 많이 지운 블록) - (데이터가 든 블록 가운데 가장 적게 지운 블록)이 100을 넘으면 한다. 호스트 쓰기 지연 때문에 GC 한 번에 블록 하나만 옮긴다.', True),
+            kn('on_ask', K['K8'], True),
+            K3c,
+        ],
+        'checks': [
+            t('차가운 블록도 옮겨 고르게 닳음', 'f3b-static-wl.test.js', timeout=900_000),
+            badmark(12), nodyn(12),
+        ],
+    },
+    # 13 B2
+    {
+        'type': 'bugfix', 'title': 'B2 끝을 넘는 쓰기',
+        'report': '고객 문의: 디스크 끝에 걸친 쓰기가 성공으로 끝나고, 가끔은 펌웨어가 아예 멈춘다고 한다.',
+        'knowledge': [
+            kn('on_ask', K['K2'], True),
+            kn('on_ask', '읽기도 같다. 끝을 넘는 읽기도 오류로 끝내야 한다.'),
+            K3c,
+        ],
+        'checks': [
+            t('끝을 넘는 읽기·쓰기는 80h, 아무것도 쓰지 않음', 'b2-range.test.js'),
+            rw(13), nodyn(13),
+        ],
+    },
+    # 14 D4
+    {
+        'type': 'spec', 'title': 'D4 매체 오류 설계', 'expectedFiles': SPEC_FILES, 'limits': SPEC_LIMITS,
+        'report': 'NAND 읽기·프로그램 실패를 제대로 다루고 싶다. 지금은 고칠 수 없는 읽기도 깨진 데이터를 성공으로 돌려주고, 프로그램이 실패하면 그 데이터를 잃는다. 설계를 docs/design/media-errors.md에 남겨 줘. 구현은 두 번(읽기 오류 보고, 프로그램 실패와 블록 은퇴)에 나눈다.',
+        'knowledge': [
+            kn('on_ask', '끝내 읽지 못한 호스트 읽기는 Unrecovered Read Error(SCT 2, SC 81h)로 끝낸다. 다시 읽기는 지금처럼 정해진 횟수만큼 하고 그 안에 읽히면 성공이다. 깨진 데이터를 성공으로 주면 안 되고, 다시 읽어도 마찬가지다.'),
+            kn('recall', '읽기 실패나 ECC 경고만으로 블록을 배드로 만들면 안 된다. 그 블록의 다른 데이터까지 못 쓰게 된다. 지금 펌웨어가 그렇게 해서 블록이 줄어든다는 현장 보고가 있다.'),
+            kn('on_ask', '프로그램이 실패해도 그 데이터를 잃으면 안 된다. 다른 블록에 다시 쓰고, 실패한 블록은 더 쓰지 않는다(은퇴). 은퇴는 정상 종료 뒤 다시 켜도 유지돼야 한다.'),
+            kn('recall', K['K2'] + ' 매체 오류는 이것과 다른 상태로 구분한다.', True),
+            kn('recall', K['K6'], True),
+            kn('on_ask', K['K4'], True),
+        ],
+        'checks': [
+            issue('끝내 못 읽으면 81h', '정해진 횟수만큼 다시 읽은 뒤에도 읽지 못한 호스트 읽기는 Unrecovered Read Error(SCT 2, SC 81h)로 끝내고 깨진 데이터를 성공으로 돌려주지 않는다(다시 읽어도). 다른 상태 코드이거나 재시도 없이 바로 오류로 하거나 정하지 않았으면 틀림.'),
+            issue('읽기 실패로 배드 표시하지 않음', '읽기 실패나 ECC 경고만으로는 블록을 그로운 배드로 표시하지 않는다. 지금처럼 배드로 표시하게 두었으면 틀림.'),
+            issue('프로그램 실패는 데이터를 지키고 블록 은퇴', '프로그램이 실패하면 그 데이터를 다른 블록에 다시 써 잃지 않고, 실패한 블록은 더 쓰지 않는다(은퇴). 데이터를 잃게 두거나 블록을 계속 쓰게 했으면 틀림.'),
+            issue('GC 읽기의 ECC 경고는 끈 채로', 'GC 읽기는 ECC 경고를 끈 채로 둔다(일부러 다름). 문서가 GC 읽기에도 경고를 켜거나 같은 경고 처리를 하게 했으면 틀림. 다루지 않았으면 맞다.', ask=False),
+            issue('잘못된 요청과 매체 오류를 구분', '매체 오류(81h 등, SCT 2)와 잘못된 요청(범위 밖 80h, SCT 0)을 섞지 않는다. 매체 오류에 80h나 SCT 0 상태를 쓰게 했으면 틀림. 따로 적지 않았어도 매체 오류에 SCT 2를 쓰면 맞다.', ask=False),
+            scope(14),
+        ],
+    },
+    # 15 F4a
+    {
+        'type': 'feature', 'title': 'F4a 읽기 오류 보고',
+        'report': 'docs/design/media-errors.md 구현 1단계: 고칠 수 없는 읽기의 오류 보고를 해 줘.',
+        'knowledge': [
+            kn('on_ask', '끝내 읽지 못한 호스트 읽기는 Unrecovered Read Error(SCT 2, SC 81h)로 끝낸다. 다시 읽기는 지금처럼 정해진 횟수만큼 하고 그 안에 읽히면 성공이다. 깨진 데이터를 성공으로 주면 안 되고, 다시 읽어도 마찬가지다.', True),
+            kn('recall', '읽기 실패나 ECC 경고만으로 블록을 배드로 만들면 안 된다. 그 블록의 다른 데이터까지 못 쓰게 된다.', True),
+            K3c,
+        ],
+        'checks': [
+            t('끝내 못 읽으면 81h, 다시 읽어 읽히면 성공', 'f4a-read-error.test.js'),
+            t('읽기 실패와 경고는 배드로 만들지 않음', 'f4a-no-bad-mark.test.js'),
+            nodyn(15),
+        ],
+    },
+    # 16 F4b
+    {
+        'type': 'feature', 'title': 'F4b 프로그램 실패와 블록 은퇴',
+        'report': 'docs/design/media-errors.md 구현 2단계: 프로그램이 실패해도 데이터를 지키고 그 블록을 은퇴시켜 줘.',
+        'knowledge': [
+            kn('on_ask', '프로그램이 실패해도 그 데이터를 잃으면 안 된다. 다른 블록에 다시 쓰고, 실패한 블록은 더 쓰지 않는다(은퇴). 은퇴는 정상 종료 뒤 다시 켜도 유지돼야 한다.', True),
+            kn('recall', K['K5'], True),
+            kn('on_ask', K['K4'], True),
+            kn('on_ask', '정상 종료(CC.SHN)에서 호스트는 SHST가 완료(2)로 바뀌는 순간 전원을 끊는다. 그 전에 내릴 것을 모두 NAND에 내려야 한다.', True),
+            K3c,
+        ],
+        'checks': [
+            t('프로그램 실패에도 데이터를 잃지 않고 블록 은퇴', 'f4b-program-fail.test.js', timeout=300_000),
+            badmark(16), nodyn(16),
+        ],
+    },
+    # 17 R2
+    {
+        'type': 'refactor', 'title': 'R2 블록 리스트 합치기',
+        'report': '빈 블록 리스트와 GC 희생 블록 리스트(무효 수별)가 같은 이중 연결 리스트 코드를 따로 갖고 있다(address_translation.c, garbage_collection.c 등). 하나로 합쳐 줘. 동작은 바뀌면 안 된다.',
+        'knowledge': [
+            kn('upfront', 'NAND에 내리는 명령과 그 차례는 지금과 같아야 한다. 이번에는 정리만 한다.'),
+            kn('recall', K['K8'] + ' GC 희생 리스트에서 무효 수가 같으면 먼저 들어간 블록부터 고르는 것도 그래서다.', True),
+            K3c,
+        ],
+        'checks': [
+            t('같은 부하에서 NAND 상태가 기준과 같음 #17', 'golden-2.test.js', guard=True, timeout=300_000),
+            gcg(17), nodyn(17),
+        ],
+    },
+    # 18 D5
+    {
+        'type': 'spec', 'title': 'D5 SMART 설계', 'expectedFiles': SPEC_FILES, 'limits': SPEC_LIMITS,
+        'report': 'nvme smart-log로 장치 건강 정보를 보고 싶다. Get Log Page(02h)의 SMART / Health Information 설계를 docs/design/smart.md에 남겨 줘. 구현은 두 번(값과 로그 페이지, 전원 주기를 넘는 유지)에 나눈다.',
+        'knowledge': [
+            kn('on_ask', 'Data Units Read/Written은 512바이트 단위로 센 양을 1000으로 나눠 올림한 값이다(NVMe 규격). Host Read/Write Commands는 성공으로 끝난 읽기·쓰기 명령만 센다(Flush, DSM은 세지 않는다).'),
+            kn('on_ask', K['K7'] + ' Percentage Used는 사용자 블록의 평균 지우기 횟수를 정격 P/E로 나눈 백분율이고 소수는 올림한다.', True),
+            kn('on_ask', '지원하지 않는 로그 페이지는 Invalid Log Page(SCT 1, SC 09h)로 끝낸다. ' + K['K2'][K['K2'].index('일부만'):], True),
+            kn('on_ask', 'Media and Data Integrity Errors는 Unrecovered Read Error로 끝난 읽기 수다.', True),
+            kn('on_ask', 'Available Spare는 배드 블록 대체에 남은 예비 블록의 비율이고 처음이 100, 문턱(Available Spare Threshold)은 10이다.'),
+            kn('on_ask', 'Power Cycles와 Unsafe Shutdowns(정상 종료 없이 전원이 나간 횟수), 그리고 다른 카운터도 전원 주기를 넘어 이어져야 한다.'),
+        ],
+        'checks': [
+            issue('Data Units는 512바이트×1000 단위 올림', 'Data Units Read/Written은 512바이트 단위로 센 양을 1000으로 나눠 올림한다. 버림이나 다른 단위면 틀림.'),
+            issue('Percentage Used는 평균 지우기 횟수 ÷ 3000', 'Percentage Used는 평균 지우기 횟수를 정격 P/E 3000으로 나눈 백분율(올림)이다. 다른 P/E 값이나 다른 기준이면 틀림.', ask=False),
+            issue('지원하지 않는 로그는 09h', '지원하지 않는 로그 페이지는 Invalid Log Page(SCT 1, SC 09h)로 끝낸다. 성공으로 0을 돌려주거나 다른 상태이거나 정하지 않았으면 틀림.'),
+            issue('카운터 유지와 Unsafe Shutdowns', '카운터를 NAND에 남겨 전원 주기를 넘어 잇고, Power Cycles는 켤 때마다, Unsafe Shutdowns는 정상 종료 없이 꺼졌을 때 1씩 는다(알아내는 방법이 있음). 유지하지 않거나 알아낼 방법이 없으면 틀림.'),
+            scope(18),
+        ],
+    },
+    # 19 F5a
+    {
+        'type': 'feature', 'title': 'F5a SMART 값',
+        'report': 'docs/design/smart.md 구현 1단계: 카운터와 Get Log Page 02h를 해 줘(전원 주기 동안만).',
+        'knowledge': [
+            kn('on_ask', K['K7'] + ' Percentage Used는 사용자 블록의 평균 지우기 횟수를 정격 P/E로 나눈 백분율이고 소수는 올림한다.', True),
+            kn('on_ask', 'Data Units Read/Written은 512바이트 단위로 센 양을 1000으로 나눠 올림한 값이다(NVMe 규격). Host Read/Write Commands는 성공으로 끝난 읽기·쓰기 명령만 센다(Flush, DSM은 세지 않는다).', True),
+            kn('on_ask', 'Media and Data Integrity Errors는 Unrecovered Read Error로 끝난 읽기 수다.', True),
+            K3c,
+        ],
+        'checks': [
+            t('SMART 명령 수와 Data Units, 지원하지 않는 로그', 'f5a-counters.test.js'),
+            t('Percentage Used와 Media Errors', 'f5a-wear-media.test.js', timeout=480_000),
+            nodyn(19),
+        ],
+    },
+    # 20 F5b
+    {
+        'type': 'feature', 'title': 'F5b SMART 유지',
+        'report': 'docs/design/smart.md 구현 2단계: SMART 카운터를 전원 주기를 넘어 유지하고 Power Cycles, Unsafe Shutdowns를 세 줘.',
+        'knowledge': [
+            kn('on_ask', K['K4'], True),
+            kn('recall', K['K5'], True),
+            kn('on_ask', 'Power Cycles와 Unsafe Shutdowns(정상 종료 없이 전원이 나간 횟수), 그리고 다른 카운터도 전원 주기를 넘어 이어져야 한다.', True),
+            K3c,
+        ],
+        'checks': [
+            t('SMART 카운터 유지, Power Cycles, Unsafe Shutdowns', 'f5b-persist.test.js'),
+            badmark(20),
+        ],
+    },
+    # 21 R3
+    {
+        'type': 'refactor', 'title': 'R3 스케줄러 나누기',
+        'report': 'firmware/request_schedule.c의 채널별 스케줄링(SchedulingNandReqPerCh)이 너무 길고 같은 모양이 반복된다. 상태별 함수로 나눠 줘. 동작은 바뀌면 안 된다.',
+        'knowledge': [
+            kn('upfront', 'NAND에 내리는 명령과 그 차례는 지금과 같아야 한다. 이번에는 정리만 한다.'),
+            kn('recall', '채널이 비었을 때 상태 확인, 읽기 트리거, 지우기, 쓰기, 읽기 전송 순으로 내보내는 차례는 읽기 지연 요구 때문이다. 바꾸면 안 된다.'),
+            K3c,
+        ],
+        'checks': [
+            t('같은 부하에서 NAND 상태가 기준과 같음 #21', 'golden-3.test.js', guard=True, timeout=300_000),
+            nodyn(21),
+        ],
+    },
+]
+
+for i, w in enumerate(works):
+    if i > 0:
+        w['merge'] = True
+
+scenario = {
+    'id': '40-ssd-campaign',
+    'type': 'feature',
+    'repoName': 'cosmos-ssd',
+    'title': 'SSD 펌웨어(Cosmos+ OpenSSD GreedyFTL)에서 설계 5, 기능 10, 리팩터 3, 버그 3을 이어 머지하며 하기',
+    'purpose': '낯선 큰 C 코드에서 relay로 버그 수정, 설계, 그 설계의 구현, 리팩터링을 21개 Work로 이어 간다. Work가 끝날 때마다 도구가 그 브랜치를 main에 머지한다. 사람이 앞 Work에서 알려 준 팀 규칙(K3 동적 할당 금지, K4 온플래시 형식, K5 spare 첫 바이트, K6 GC 읽기 경고, K8 결정적 선택)과 도메인 사실(K1 0 읽기, K2 범위 오류, K7 정격 P/E)이 뒤 Work에서 다시 필요하다. 지식을 켠 relay가 끈 relay보다 덜 다시 묻고(PM1) 숨긴 시험을 더 통과하는지(PM2) 본다. docs/eval-ssd.md.',
+    'preferences': ['바꾼 것을 짧게 보고받고 싶다. make test가 통과하는지도 알려 주면 좋겠다.'],
+    'reveals': [],
+    'events': [],
+    'expectedFiles': ['firmware/**', 'host/tests/**', 'host/sim/**', 'host/Makefile', 'docs/**', 'Makefile', 'README.md'],
+    'repoTest': ['make', '-s', 'test'],
+    'repoTestTimeoutMs': 600_000,
+    'copyIgnore': ['host/build'],
+    'limits': {'minutes': 120, 'turns': 150},
+    'works': works,
+}
+
+json.dump(scenario, open(sys.argv[1], 'w'), ensure_ascii=False, indent=2)
+print(len(works), sum(len(w['checks']) for w in works))

@@ -12,6 +12,8 @@
   "expectedFiles": [
     "firmware/**",
     "host/tests/**",
+    "host/sim/**",
+    "host/Makefile",
     "docs/**",
     "Makefile",
     "README.md"

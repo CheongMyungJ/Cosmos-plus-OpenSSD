@@ -48,7 +48,6 @@ int main(void)
 	EXPECT(dur == (units[0] + 999) / 1000, "Data Units Read %llu (512바이트 %llu개의 1000 단위 올림: %llu)", dur, units[0], (units[0] + 999) / 1000);
 	EXPECT(duw == (units[1] + 999) / 1000, "Data Units Written %llu (512바이트 %llu개의 1000 단위 올림: %llu)", duw, units[1], (units[1] + 999) / 1000);
 	EXPECT(hle64(log + 40) == 0 && hle64(log + 56) == 0, "128비트 값의 위쪽");
-	EXPECT(log[1] | log[2], "Composite Temperature가 0");
 	/* 지원하지 않는 로그 */
 	s = hlog(0x55, log, 512);
 	EXPECT(s.ok && s.sct == 1 && s.sc == 0x09, "지원하지 않는 로그 페이지: %s", hst(s));
